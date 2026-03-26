@@ -136,9 +136,16 @@ export class BwMem {
   }
 
   /** Semantic search across conversation summaries. */
-  async searchConversations(userId: string, query: string, limit?: number) {
+  async searchConversations(userId: string, query: string, limit?: number, threshold?: number) {
     this.ensureInitialized();
-    return this._embedding.searchSimilarConversations(userId, query, limit);
+    return this._embedding.searchSimilarConversations(userId, query, limit, threshold);
+  }
+
+  /** Trigger consolidation on demand. Type: 'daily' | 'weekly'. Requires consolidation enabled. */
+  async triggerConsolidation(type: 'daily' | 'weekly'): Promise<void> {
+    this.ensureInitialized();
+    if (!this._scheduler) throw new Error('Consolidation is not enabled');
+    await this._scheduler.addJob(type);
   }
 
   /** Shutdown all connections and schedulers. */

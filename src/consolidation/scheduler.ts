@@ -51,7 +51,9 @@ export class ConsolidationScheduler {
   }
 
   async start(): Promise<void> {
-    // Create worker to process jobs
+    // Create worker with a duplicate Redis connection (BullMQ requires maxRetriesPerRequest: null)
+    const workerConnection = this.redis.client.duplicate({ maxRetriesPerRequest: null });
+
     this.worker = new Worker(
       QUEUE_NAME,
       async (job) => {
@@ -77,7 +79,7 @@ export class ConsolidationScheduler {
           throw error;
         }
       },
-      { connection: this.redis.client, concurrency: 1 },
+      { connection: workerConnection, concurrency: 1 },
     );
 
     this.worker.on('failed', (job, err) => {
@@ -110,6 +112,11 @@ export class ConsolidationScheduler {
       userId,
       sessionId,
     } as ConsolidationJobData);
+  }
+
+  /** Add a consolidation job (daily or weekly) to the queue. */
+  async addJob(type: 'daily' | 'weekly'): Promise<void> {
+    await this.queue.add(type, { type } as ConsolidationJobData);
   }
 
   async stop(): Promise<void> {
