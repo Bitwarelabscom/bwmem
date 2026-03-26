@@ -223,8 +223,10 @@ try {
 
   console.log('\\n[ Fact Extraction (real LLM) ]\\n');
 
-  console.log('  ... waiting 15s for background processing (embeddings + fact extraction) ...');
-  await new Promise(r => setTimeout(r, 15000));
+  console.log('  ... flushing background processing (embeddings + fact extraction) ...');
+  const flushStart = Date.now();
+  await session.flush();
+  console.log(\`  Flush completed in \${((Date.now() - flushStart) / 1000).toFixed(1)}s\`);
 
   const facts = await mem.facts.get('llm-test-user');
   console.log(\`  Extracted \${facts.length} facts:\`);
@@ -265,14 +267,14 @@ try {
   console.log('\\n[ Semantic Search ]\\n');
 
   const fraudResults = await mem.searchMessages('llm-test-user', 'fraud detection models using Python and PyTorch', 5, 0.3);
-  console.log(\`  Search "fraud detection models": \${fraudResults.length} results\`);
+  console.log(\`  Search "fraud detection models": \${fraudResults.length} results (threshold=0.3)\`);
   for (const r of fraudResults.slice(0, 3)) {
     console.log(\`    [\${r.similarity.toFixed(3)}] \${r.content.slice(0, 80)}...\`);
   }
   assert(fraudResults.length > 0, 'Semantic search returns results', \`\${fraudResults.length} matches\`);
 
   const hobbyResults = await mem.searchMessages('llm-test-user', 'rock climbing on weekends', 5, 0.3);
-  console.log(\`  Search "rock climbing": \${hobbyResults.length} results\`);
+  console.log(\`  Search "rock climbing": \${hobbyResults.length} results (threshold=0.3)\`);
   for (const r of hobbyResults.slice(0, 3)) {
     console.log(\`    [\${r.similarity.toFixed(3)}] \${r.content.slice(0, 80)}...\`);
   }
@@ -294,7 +296,8 @@ try {
     sessionId: session.id,
   });
   console.log(\`  Context for "Marcus\\'s work": \${context1.sourcesResponded} sources\`);
-  assert(context1.sourcesResponded >= 3, 'Context sources responded', \`\${context1.sourcesResponded}/9\`);
+  const respondedCount = parseInt(context1.sourcesResponded);
+  assert(respondedCount >= 3, 'Context sources responded', context1.sourcesResponded);
   assert(context1.facts.length > 0, 'Context includes facts', \`\${context1.facts.length} facts\`);
   assert(typeof context1.formatted === 'string' && context1.formatted.length > 0, 'Context formatted string', \`\${context1.formatted.length} chars\`);
 

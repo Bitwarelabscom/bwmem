@@ -26,6 +26,7 @@ export class Session {
   private logger: Logger;
   private messageBuffer: Array<{ role: string; content: string }> = [];
   private ended = false;
+  private _pending: Set<Promise<void>> = new Set();
 
   constructor(
     id: string, userId: string, metadata: Record<string, unknown>,
@@ -67,9 +68,11 @@ export class Session {
     this.messageBuffer.push({ role, content });
 
     // Background: embedding + sentiment + fact extraction + emotional moments
-    this.processMessageBackground(messageId, role, content).catch(err =>
+    const task = this.processMessageBackground(messageId, role, content).catch(err =>
       this.logger.error('Background message processing failed', { error: (err as Error).message })
     );
+    this._pending.add(task);
+    task.then(() => this._pending.delete(task), () => this._pending.delete(task));
 
     return {
       id: messageId,
@@ -79,6 +82,13 @@ export class Session {
       content,
       createdAt: new Date(),
     };
+  }
+
+  /** Wait for all pending background processing (embeddings, fact extraction, etc.) to complete. */
+  async flush(): Promise<void> {
+    while (this._pending.size > 0) {
+      await Promise.allSettled([...this._pending]);
+    }
   }
 
   /** End this session. Triggers episodic consolidation. */
