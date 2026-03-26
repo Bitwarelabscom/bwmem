@@ -130,9 +130,9 @@ export class BwMem {
   }
 
   /** Semantic search across messages. */
-  async searchMessages(userId: string, query: string, limit?: number) {
+  async searchMessages(userId: string, query: string, limit?: number, threshold?: number) {
     this.ensureInitialized();
-    return this._embedding.searchSimilarMessages(userId, query, limit);
+    return this._embedding.searchSimilarMessages(userId, query, limit, threshold);
   }
 
   /** Semantic search across conversation summaries. */
