@@ -47,7 +47,7 @@ export class ContextBuilder {
     const results = await Promise.allSettled([
       safeQuery('facts', this.facts.getUserFacts(userId, undefined, options?.maxFacts ?? 30), [], timeout, this.logger),
       safeQuery('similarMessages', query
-        ? this.embedding.searchSimilarMessages(userId, query, options?.maxSimilarMessages ?? 5, options?.similarityThreshold ?? 0.7, sessionId)
+        ? this.embedding.searchSimilarMessages(userId, query, options?.maxSimilarMessages ?? 5, options?.similarityThreshold ?? 0.25, sessionId)
         : Promise.resolve([]), [], timeout, this.logger),
       safeQuery('similarConversations', query
         ? this.embedding.searchSimilarConversations(userId, query, 3)

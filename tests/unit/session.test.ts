@@ -33,6 +33,7 @@ describe('Session', () => {
       'session-1', 'user-1', {},
       pg as never, embedding, sentiment, centroid,
       facts, emotional, contradictions,
+      llm, // LLM for contradiction detection
       null, // no scheduler
       'bwmem_', mockLogger,
     );

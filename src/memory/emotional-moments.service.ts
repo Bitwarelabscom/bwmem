@@ -24,13 +24,24 @@ export class EmotionalMomentsService {
       // Generate a brief moment tag via LLM (fire-and-forget style)
       let momentTag = '';
       try {
+        const valenceLabel = valence > 0.3 ? 'positive' : valence < -0.3 ? 'negative' : 'neutral';
         momentTag = await this.llm.chat([
-          { role: 'system', content: 'Summarize this emotional moment in one short phrase (max 10 words). Return only the phrase.' },
+          { role: 'system', content: `Tag this emotional moment with a specific, descriptive phrase (3-8 words).
+Be specific about WHAT caused the emotion, not just the emotion itself.
+
+Good examples: "Career milestone and pride", "Frustration with slow progress", "Nostalgia for childhood home", "Excitement about new relationship", "Grief over lost friendship"
+Bad examples: "positive moment", "negative feeling", "emotional experience", "happy"
+
+The emotional valence is ${valenceLabel}. Return ONLY the phrase, no quotes.` },
           { role: 'user', content: rawText.slice(0, 500) },
         ], { temperature: 0.3, maxTokens: 30 });
         momentTag = momentTag.trim().replace(/^["']|["']$/g, '');
+        // Reject generic tags
+        if (/^(positive|negative|neutral|emotional)\s*(moment|feeling|experience)?$/i.test(momentTag)) {
+          momentTag = `${valenceLabel} reaction: ${rawText.slice(0, 40).trim()}`;
+        }
       } catch {
-        momentTag = valence > 0 ? 'positive moment' : 'negative moment';
+        momentTag = `${valence > 0 ? 'positive' : 'negative'} reaction: ${rawText.slice(0, 40).trim()}`;
       }
 
       await this.pg.query(

@@ -7,7 +7,7 @@ import type { FactsService } from '../memory/facts.service.js';
 import type { EmotionalMomentsService } from '../memory/emotional-moments.service.js';
 import type { ContradictionService } from '../memory/contradiction.service.js';
 import type { ConsolidationScheduler } from '../consolidation/scheduler.js';
-import type { Logger, Message, RecordMessageInput } from '../types.js';
+import type { LLMProvider, Logger, Message, RecordMessageInput, Fact, ExtractedFact } from '../types.js';
 
 export class Session {
   readonly id: string;
@@ -21,6 +21,7 @@ export class Session {
   private facts: FactsService;
   private emotionalMoments: EmotionalMomentsService;
   private contradictions: ContradictionService;
+  private llm: LLMProvider;
   private scheduler: ConsolidationScheduler | null;
   private prefix: string;
   private logger: Logger;
@@ -33,7 +34,7 @@ export class Session {
     pg: PgClient, embedding: EmbeddingService, sentiment: SentimentService,
     centroid: CentroidService, facts: FactsService,
     emotionalMoments: EmotionalMomentsService, contradictions: ContradictionService,
-    scheduler: ConsolidationScheduler | null,
+    llm: LLMProvider, scheduler: ConsolidationScheduler | null,
     prefix: string, logger: Logger,
   ) {
     this.id = id;
@@ -46,6 +47,7 @@ export class Session {
     this.facts = facts;
     this.emotionalMoments = emotionalMoments;
     this.contradictions = contradictions;
+    this.llm = llm;
     this.scheduler = scheduler;
     this.prefix = prefix;
     this.logger = logger;
@@ -155,26 +157,44 @@ export class Session {
 
     // For user messages: extract facts + check emotional moments + contradictions
     if (role === 'user') {
-      // Fact extraction (every 3 messages to reduce LLM calls)
-      if (this.messageBuffer.length % 3 === 0 || this.messageBuffer.length <= 2) {
+      // Fact extraction every 3 messages (batched to reduce LLM calls and avoid upstream rate limits)
+      if (this.messageBuffer.length % 3 === 0) {
         const recentMessages = this.messageBuffer.slice(-6);
         const extracted = await this.facts.extractFromMessages(recentMessages, this.userId, this.id);
         if (extracted.length > 0) {
+          // Snapshot existing facts BEFORE storing new ones (for contradiction comparison)
+          const existingFacts = await this.facts.getUserFacts(this.userId);
+
           await this.facts.storeExtractedFacts(this.userId, extracted, this.id);
 
-          // Check for contradictions on extracted facts
-          const existingFacts = await this.facts.getUserFacts(this.userId);
-          for (const ef of extracted) {
-            if (ef.isCorrection) {
-              const existing = existingFacts.find(f => f.factKey === ef.factKey);
-              if (existing) {
-                await this.contradictions.createSignal(
-                  this.userId, this.id, ef.factKey,
-                  ef.factValue, existing.factValue,
-                  'correction'
-                );
+          // Check for contradictions against the PRE-STORE snapshot
+          if (existingFacts.length > 0) {
+            for (const ef of extracted) {
+              // Direct correction (same BASE key, different value)
+              // Strip multi-valued slugs for comparison (child:saga → child)
+              if (ef.isCorrection) {
+                const newBase = ef.factKey.split(':')[0];
+                const existing = existingFacts.find(f => {
+                  const existBase = f.factKey.split(':')[0];
+                  return existBase === newBase && f.category === ef.category;
+                });
+                if (existing && existing.factValue !== ef.factValue) {
+                  // Skip if the keys have different slugs (multi-valued, not a correction)
+                  const existSlug = existing.factKey.includes(':') ? existing.factKey.split(':')[1] : '';
+                  const newSlug = ef.factKey.includes(':') ? ef.factKey.split(':')[1] : '';
+                  if (existSlug && newSlug && existSlug !== newSlug) continue;
+
+                  await this.contradictions.createSignal(
+                    this.userId, this.id, ef.factKey,
+                    ef.factValue, existing.factValue,
+                    'correction'
+                  );
+                }
               }
             }
+
+            // Behavioral contradiction detection via LLM
+            await this.detectBehavioralContradictions(extracted, existingFacts);
           }
         }
       }
@@ -186,6 +206,97 @@ export class Session {
           sentimentResult.valence, sentimentResult.arousal, sentimentResult.dominance,
         );
       }
+    }
+  }
+
+  /** Detect behavioral contradictions via LLM — catches semantic conflicts across different fact keys. */
+  private async detectBehavioralContradictions(
+    newFacts: ExtractedFact[], existingFacts: Fact[],
+  ): Promise<void> {
+    // Only run if there are enough facts to potentially conflict
+    if (newFacts.length === 0 || existingFacts.length === 0) return;
+
+    const existingList = existingFacts
+      .slice(0, 20)
+      .map(f => `${f.category}/${f.factKey}: ${f.factValue}`)
+      .join('\n');
+    const newList = newFacts
+      .map(f => `${f.category}/${f.factKey}: ${f.factValue}`)
+      .join('\n');
+
+    try {
+      const response = await this.llm.chat([
+        { role: 'system', content: `You detect contradictions between a user's existing facts and newly stated facts.
+A contradiction is when a new fact GENUINELY conflicts with or reverses an existing fact.
+
+CRITICAL — these are NOT contradictions:
+- Different employers (current vs previous job — people change jobs)
+- Two employers at once (people have side jobs, past jobs, consulting)
+- Same person in multiple relationship categories (e.g., brother AND colleague — people can be both)
+- "friend:X" and "sibling:X" for same person — not a contradiction, they're both
+- Different locations at different times (lives in X now, lived in Y before)
+- Multiple hobbies, interests, skills, or friends
+- Facts with "past_" or "previous_" prefix — these are historical, not current
+- Any fact that ADDS information without negating existing facts
+
+ONLY flag as contradictions:
+- Direct reversals: "I'm vegetarian" then "I ate steak for dinner"
+- Explicit negations: "I don't have pets" then "I have a dog"
+- Mutually exclusive states: "I've never left Sweden" then "I lived in Tokyo"
+
+Return a JSON array. Be VERY conservative — most fact pairs are NOT contradictions:
+[{"existingFact": "category/key: value", "newFact": "category/key: value", "reason": "brief explanation"}]
+
+Return [] if no contradictions. When in doubt, return [].` },
+        { role: 'user', content: `Existing facts:\n${existingList}\n\nNew facts:\n${newList}` },
+      ], { temperature: 0.1, maxTokens: 500, json: true });
+
+      // Parse response — handle array, wrapped array, or single object
+      let contradictions: Array<{ existingFact: string; newFact: string; reason: string }>;
+      const arrayMatch = response.match(/\[[\s\S]*\]/);
+      if (arrayMatch) {
+        contradictions = JSON.parse(arrayMatch[0]);
+      } else {
+        try {
+          const parsed = JSON.parse(response);
+          if (Array.isArray(parsed)) {
+            contradictions = parsed;
+          } else {
+            const arrayVal = Object.values(parsed).find(v => Array.isArray(v));
+            contradictions = (arrayVal as typeof contradictions) ?? [];
+          }
+        } catch {
+          return;
+        }
+      }
+
+      for (const c of contradictions) {
+        if (!c.existingFact || !c.newFact) continue;
+
+        // Extract the key portions for the signal
+        const existingKey = c.existingFact.split(':')[0]?.trim() ?? c.existingFact;
+        const newKey = c.newFact.split(':')[0]?.trim() ?? c.newFact;
+        const existingValue = c.existingFact.split(':').slice(1).join(':').trim() || c.existingFact;
+        const newValue = c.newFact.split(':').slice(1).join(':').trim() || c.newFact;
+
+        await this.contradictions.createSignal(
+          this.userId, this.id,
+          `${existingKey} vs ${newKey}`,
+          newValue,
+          existingValue,
+          'misremember',
+        );
+
+        this.logger.info('Behavioral contradiction detected', {
+          existing: c.existingFact,
+          new: c.newFact,
+          reason: c.reason,
+        });
+      }
+    } catch (error) {
+      this.logger.error('Behavioral contradiction detection failed', {
+        error: (error as Error).message,
+      });
     }
   }
 }

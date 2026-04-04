@@ -116,7 +116,7 @@ export class EmbeddingService {
 
   /** Search for semantically similar messages. */
   async searchSimilarMessages(
-    userId: string, query: string, limit = 5, threshold = 0.7,
+    userId: string, query: string, limit = 5, threshold = 0.25,
     excludeSessionId?: string,
   ): Promise<SimilarMessage[]> {
     try {
@@ -159,7 +159,7 @@ export class EmbeddingService {
 
   /** Search for semantically similar conversations by summary. */
   async searchSimilarConversations(
-    userId: string, query: string, limit = 3, threshold = 0.6,
+    userId: string, query: string, limit = 3, threshold = 0.2,
   ): Promise<SimilarConversation[]> {
     try {
       const embedding = await this.generate(query);

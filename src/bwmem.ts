@@ -1,6 +1,10 @@
 import type {
   BwMemConfig,
   BuildContextOptions,
+  ContradictionSignal,
+  ConversationSummary,
+  EmotionalMoment,
+  BehavioralObservation,
   Fact,
   MemoryContext,
   SessionConfig,
@@ -87,6 +91,7 @@ export class BwMem {
     this._sessionManager = new SessionManager(
       this.pg, this._embedding, this._sentiment, this._centroid,
       this._facts, this._emotionalMoments, this._contradictions,
+      this.config.llm,
       prefix, this.config.session.inactivityTimeoutMs, logger,
     );
 
@@ -141,6 +146,42 @@ export class BwMem {
     return this._embedding.searchSimilarConversations(userId, query, limit, threshold);
   }
 
+  /** Emotional moments API - retrieve captured emotional moments. */
+  get emotions(): EmotionsAPI {
+    this.ensureInitialized();
+    return {
+      getRecent: (userId: string, days?: number, limit?: number) =>
+        this._emotionalMoments.getRecent(userId, days, limit),
+    };
+  }
+
+  /** Contradictions API - retrieve detected contradictions. */
+  get contradictions(): ContradictionsAPI {
+    this.ensureInitialized();
+    return {
+      getUnsurfaced: (userId: string, sessionId?: string, limit?: number) =>
+        this._contradictions.getUnsurfaced(userId, sessionId, limit),
+    };
+  }
+
+  /** Behavioral observations API. */
+  get behavioral(): BehavioralAPI {
+    this.ensureInitialized();
+    return {
+      getActive: (userId: string, limit?: number) =>
+        this._behavioral.getActive(userId, limit),
+    };
+  }
+
+  /** Conversation summaries API. */
+  get summaries(): SummariesAPI {
+    this.ensureInitialized();
+    return {
+      getForSession: (sessionId: string) =>
+        this._summaries.getForSession(sessionId),
+    };
+  }
+
   /** Trigger consolidation on demand. Type: 'daily' | 'weekly'. Requires consolidation enabled. */
   async triggerConsolidation(type: 'daily' | 'weekly'): Promise<void> {
     this.ensureInitialized();
@@ -182,4 +223,20 @@ interface FactsAPI {
   store(input: StoreFact): Promise<Fact>;
   remove(factId: string, reason?: string): Promise<void>;
   search(userId: string, query: string): Promise<Fact[]>;
+}
+
+interface EmotionsAPI {
+  getRecent(userId: string, days?: number, limit?: number): Promise<EmotionalMoment[]>;
+}
+
+interface ContradictionsAPI {
+  getUnsurfaced(userId: string, sessionId?: string, limit?: number): Promise<ContradictionSignal[]>;
+}
+
+interface BehavioralAPI {
+  getActive(userId: string, limit?: number): Promise<BehavioralObservation[]>;
+}
+
+interface SummariesAPI {
+  getForSession(sessionId: string): Promise<ConversationSummary | null>;
 }
