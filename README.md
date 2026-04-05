@@ -1,26 +1,31 @@
 # @bitwarelabs/bwmem
 
-Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: facts, semantic search, emotional capture, contradiction detection, and multi-stage consolidation.
+Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: facts, semantic search, emotional capture, contradiction detection, knowledge graph, and multi-stage consolidation.
 
 Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, and long-term memory consolidation in the background.
 
+**v0.2.0** adds a hosted REST API layer, multi-tenant support, and a Neo4j knowledge graph pipeline.
+
 ## Features
 
-- **Fact extraction** — automatically extracts structured facts from conversations (name, job, preferences, etc.)
+- **Fact extraction** — automatically extracts structured facts from conversations (name, job, preferences, relationships, career signals)
 - **Semantic search** — find similar messages and conversations via pgvector embeddings
-- **Emotional capture** — detects high-emotion moments using VAD (Valence-Arousal-Dominance) analysis
-- **Contradiction detection** — catches when a user corrects or contradicts previously stored facts
+- **Emotional capture** — detects high-emotion moments using VAD (Valence-Arousal-Dominance) analysis with specific descriptive tags
+- **Contradiction detection** — LLM-powered detection of behavioral contradictions across sessions, with awareness of multi-valued facts and temporal context
 - **Memory consolidation** — episodic (per-session), daily, and weekly consolidation pipelines
 - **Conversation summaries** — auto-generated summaries with topic extraction
 - **Context builder** — aggregates 9 memory sources into a single formatted prompt injection
+- **Knowledge graph** — Neo4j integration with schema-constrained entity relationships (27 types), entity-to-entity edges, and entity-scoped subgraphs
 - **Provider-agnostic** — works with OpenAI, Ollama, OpenRouter, or any custom provider
-- **Optional knowledge graph** — Neo4j integration for entity relationships
+- **REST API** — Fastify-based multi-tenant API with API key auth, rate limiting, usage tracking, and Swagger docs
+- **Semantic fact dedup** — normalized key comparison + value similarity prevents duplicate facts across extraction batches
 
 ## Requirements
 
 - Node.js >= 18
 - PostgreSQL with [pgvector](https://github.com/pgvector/pgvector) extension
 - Redis
+- Neo4j (optional, for knowledge graph)
 
 ## Install
 
@@ -66,9 +71,112 @@ await session.end();
 await mem.shutdown();
 ```
 
+## REST API
+
+v0.2.0 includes a hosted REST API layer for multi-tenant access to all SDK features.
+
+### Running the API
+
+```bash
+# With Docker
+docker compose up -d
+
+# Or directly
+npm run start:api
+```
+
+### Configuration
+
+```env
+PORT=3420
+DATABASE_URL=postgresql://bwmem:password@localhost:5432/bwmem
+REDIS_URL=redis://:password@localhost:6379
+OPENROUTER_API_KEY=sk-or-...
+OPENROUTER_EMBEDDING_MODEL=openai/text-embedding-3-large
+OPENROUTER_CHAT_MODEL=google/gemma-4-31b-it
+OPENROUTER_EMBEDDING_DIMENSIONS=1536
+ADMIN_API_KEY=your-admin-key-min-32-chars
+API_KEY_PEPPER=your-secret-pepper
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
+```
+
+### Endpoints
+
+All endpoints under `/api/v1/`. Auth via `Authorization: Bearer <key>`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health` | Health check (no auth) |
+| `POST` | `/sessions` | Start a session |
+| `POST` | `/sessions/:id/end` | End a session |
+| `GET` | `/sessions/:id/messages` | Get session messages |
+| `POST` | `/messages` | Record a message |
+| `GET` | `/context?userId=&query=` | Build memory context |
+| `GET` | `/search?userId=&query=&type=` | Semantic search |
+| `GET` | `/facts/:userId` | Get facts |
+| `POST` | `/facts` | Store a fact |
+| `DELETE` | `/facts/:factId` | Delete a fact |
+| `GET` | `/facts/:userId/search?query=` | Search facts |
+| `GET` | `/emotions/:userId` | Emotional moments |
+| `GET` | `/contradictions/:userId` | Contradictions |
+| `POST` | `/consolidate` | Trigger consolidation (admin) |
+| `GET` | `/summary/:sessionId` | Conversation summary |
+| `GET` | `/graph/:userId` | Knowledge graph |
+| `POST` | `/admin/tenants` | Create tenant (admin) |
+| `GET` | `/admin/tenants` | List tenants (admin) |
+| `PATCH` | `/admin/tenants/:id` | Update tenant (admin) |
+
+### Usage Tiers
+
+| Tier | Users | Embeddings/mo | Rate limit | Price |
+|------|-------|--------------|-----------|-------|
+| Tester | 1 | 1,500 | 10 req/min | Free |
+| Hobby | 1 | 30,000 | 30 req/min | $4/mo |
+| Builder | 10 | 300,000 | 60 req/min | $29/mo |
+| Enterprise | Custom | Custom | Custom | Contact us |
+
+### Response Format
+
+All responses follow a consistent envelope:
+
+```json
+{ "success": true, "data": { ... } }
+{ "success": false, "error": "message", "code": "ERROR_CODE" }
+```
+
+Embedding quota headers on every response:
+- `X-Embedding-Limit` — monthly embedding quota
+- `X-Embedding-Remaining` — remaining embeddings this month
+
+### Example
+
+```bash
+# Create a tenant
+curl -X POST https://api.bitwarelabs.com/api/v1/admin/tenants \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My App", "email": "dev@example.com", "tier": "builder"}'
+
+# Use the returned API key
+curl -X POST https://api.bitwarelabs.com/api/v1/sessions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"userId": "user-1"}'
+
+curl -X POST https://api.bitwarelabs.com/api/v1/messages \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"sessionId": "...", "role": "user", "content": "My name is Vera and I live in Gothenburg"}'
+
+curl https://api.bitwarelabs.com/api/v1/facts/user-1 \
+  -H "Authorization: Bearer $API_KEY"
+```
+
 ## Providers
 
-All three bundled providers implement both `EmbeddingProvider` and `LLMProvider`, so a single instance handles both.
+All three bundled providers implement both `EmbeddingProvider` and `LLMProvider`, so a single instance handles both. The OpenRouter provider includes exponential backoff retry for 429/5xx errors.
 
 ### OpenAI
 
@@ -76,11 +184,10 @@ All three bundled providers implement both `EmbeddingProvider` and `LLMProvider`
 import { OpenAIProvider } from '@bitwarelabs/bwmem/providers/openai';
 
 const provider = new OpenAIProvider({
-  apiKey: 'sk-...',           // required
-  model: 'gpt-4o-mini',      // default
+  apiKey: 'sk-...',
+  model: 'gpt-4o-mini',                    // default
   embeddingModel: 'text-embedding-3-small', // default
-  embeddingDimensions: 1024,  // default
-  baseUrl: 'https://api.openai.com/v1', // default
+  embeddingDimensions: 1024,                // default
 });
 ```
 
@@ -103,10 +210,10 @@ const provider = new OllamaProvider({
 import { OpenRouterProvider } from '@bitwarelabs/bwmem/providers/openrouter';
 
 const provider = new OpenRouterProvider({
-  apiKey: 'sk-or-...',                    // required
-  model: 'anthropic/claude-3.5-haiku',    // default
-  embeddingModel: 'qwen/qwen3-embedding-8b', // default
-  embeddingDimensions: 1024,             // default
+  apiKey: 'sk-or-...',
+  model: 'anthropic/claude-3.5-haiku',        // default
+  embeddingModel: 'qwen/qwen3-embedding-8b',  // default
+  embeddingDimensions: 1024,                   // default
 });
 ```
 
@@ -133,21 +240,21 @@ const myProvider: EmbeddingProvider & LLMProvider = {
 
 ```typescript
 const mem = new BwMem({
-  postgres: 'postgresql://localhost/mydb',  // or PostgresConfig object
-  redis: 'redis://localhost:6379',          // or RedisConfig object
-  embeddings: provider,                     // EmbeddingProvider (required)
-  llm: provider,                            // LLMProvider (required)
-  graph: neo4jGraph,                        // GraphPlugin (optional)
+  postgres: 'postgresql://localhost/mydb',
+  redis: 'redis://localhost:6379',
+  embeddings: provider,          // EmbeddingProvider (required)
+  llm: provider,                 // LLMProvider (required)
+  graph: neo4jGraph,             // GraphPlugin (optional)
   consolidation: {
-    enabled: true,                          // default: true
-    daily: '0 2 * * *',                    // default: 2 AM daily
-    weekly: '0 3 * * 0',                   // default: 3 AM Sundays
+    enabled: true,               // default: true
+    daily: '0 2 * * *',         // default: 2 AM daily
+    weekly: '0 3 * * 0',        // default: 3 AM Sundays
   },
   session: {
-    inactivityTimeoutMs: 300_000,           // default: 5 minutes
+    inactivityTimeoutMs: 300_000, // default: 5 minutes
   },
-  tablePrefix: 'bwmem_',                   // default
-  logger: console,                          // default: built-in console logger
+  tablePrefix: 'bwmem_',         // default
+  logger: console,               // default: built-in console logger
 });
 ```
 
@@ -160,7 +267,7 @@ Connects to PostgreSQL and Redis, runs migrations (creates tables + pgvector ext
 ```typescript
 const session = await mem.startSession({
   userId: 'user-123',
-  metadata: { source: 'web' },  // optional
+  metadata: { source: 'web' },
 });
 ```
 
@@ -170,12 +277,12 @@ Aggregates memory from 9 sources in parallel with timeout protection:
 
 ```typescript
 const context = await mem.buildContext('user-123', {
-  query: 'What does the user do for work?', // for semantic search
-  sessionId: session.id,                     // exclude current session from similar messages
-  maxFacts: 30,                              // default
-  maxSimilarMessages: 5,                     // default
-  similarityThreshold: 0.7,                  // default
-  timeoutMs: 5000,                           // default
+  query: 'What does the user do for work?',
+  sessionId: session.id,        // exclude current session
+  maxFacts: 30,                 // default
+  maxSimilarMessages: 5,        // default
+  similarityThreshold: 0.25,    // default (tuned for text-embedding-3-large)
+  timeoutMs: 5000,              // default
 });
 
 // context.formatted — ready to inject into your system prompt
@@ -187,47 +294,52 @@ const context = await mem.buildContext('user-123', {
 
 #### `mem.facts`
 
-Direct access to the facts API:
-
 ```typescript
-// Get all active facts for a user
 const facts = await mem.facts.get('user-123');
-
-// Store a fact manually
-await mem.facts.store({
-  userId: 'user-123',
-  category: 'preference',
-  key: 'editor',
-  value: 'VS Code',
-  confidence: 1.0,
-});
-
-// Search facts semantically
+await mem.facts.store({ userId: 'user-123', category: 'preference', key: 'editor', value: 'VS Code' });
 const results = await mem.facts.search('user-123', 'programming tools');
-
-// Remove a fact
 await mem.facts.remove(factId);
 ```
 
 **Fact categories:** `personal`, `work`, `preference`, `hobby`, `relationship`, `goal`, `context`
 
+#### `mem.emotions`
+
+```typescript
+const moments = await mem.emotions.getRecent('user-123', 7, 10); // last 7 days, max 10
+```
+
+#### `mem.contradictions`
+
+```typescript
+const signals = await mem.contradictions.getUnsurfaced('user-123');
+```
+
+#### `mem.behavioral`
+
+```typescript
+const observations = await mem.behavioral.getActive('user-123');
+```
+
+#### `mem.summaries`
+
+```typescript
+const summary = await mem.summaries.getForSession(sessionId);
+```
+
 #### `mem.searchMessages(userId, query, limit?, threshold?)`
 
 ```typescript
-const results = await mem.searchMessages('user-123', 'machine learning', 5, 0.3);
-// Returns SimilarMessage[] with { messageId, sessionId, content, role, similarity, createdAt }
+const results = await mem.searchMessages('user-123', 'machine learning', 5, 0.25);
 ```
 
 #### `mem.searchConversations(userId, query, limit?, threshold?)`
 
 ```typescript
-const results = await mem.searchConversations('user-123', 'work discussion', 3, 0.3);
-// Returns SimilarConversation[] with { sessionId, summary, topics, similarity, createdAt }
+const results = await mem.searchConversations('user-123', 'work discussion', 3, 0.2);
 ```
 
 #### `mem.triggerConsolidation(type)`
-
-Trigger daily or weekly consolidation on demand (requires `consolidation.enabled: true`):
 
 ```typescript
 await mem.triggerConsolidation('daily');
@@ -246,7 +358,7 @@ Records a message and triggers background processing:
 
 ```typescript
 const msg = await session.recordMessage({
-  role: 'user',  // 'user' | 'assistant' | 'system'
+  role: 'user',
   content: 'I just moved to Berlin.',
 });
 ```
@@ -254,20 +366,15 @@ const msg = await session.recordMessage({
 **Background processing** (fire-and-forget):
 - Embedding generation + storage
 - Sentiment analysis (VAD model)
-- Fact extraction (every 3 user messages)
-- Contradiction checking against stored facts
-- Emotional moment capture (high valence/arousal)
+- Fact extraction (every 3 user messages) with semantic dedup
+- LLM contradiction detection against all stored facts
+- Emotional moment capture with descriptive tagging
 - Session centroid update
+- Knowledge graph sync (entities + relationships)
 
 #### `session.flush(): Promise<void>`
 
-Wait for all pending background processing to complete. Useful in tests or when you need search results immediately after recording messages.
-
-```typescript
-await session.recordMessage({ role: 'user', content: '...' });
-await session.flush(); // all embeddings and facts now stored
-const results = await mem.searchMessages(userId, '...');
-```
+Wait for all pending background processing to complete.
 
 #### `session.end(): Promise<void>`
 
@@ -277,35 +384,7 @@ Ends the session and triggers episodic consolidation (pattern extraction + conve
 
 Returns all messages in the session with sentiment data.
 
-## Consolidation
-
-Three-stage memory consolidation pipeline:
-
-### Episodic (on session end)
-
-When `session.end()` is called, the SDK:
-1. Builds a transcript from the session's messages
-2. Sends it to the LLM to extract patterns (themes, mood shifts, key moments, preference signals)
-3. Stores patterns in `episodic_patterns` table
-4. Generates a conversation summary with embedding
-
-### Daily (cron or manual)
-
-Runs at 2 AM by default or via `mem.triggerConsolidation('daily')`:
-1. Gets recent episodic patterns (last 24h)
-2. LLM aggregates them into semantic knowledge (preferences, known facts, behavioral baselines)
-3. Merges with existing semantic knowledge
-4. Expires old behavioral observations
-
-### Weekly (cron or manual)
-
-Runs at 3 AM Sundays by default or via `mem.triggerConsolidation('weekly')`:
-1. Reviews all semantic knowledge for consistency
-2. Cross-references with stored facts
-3. Prunes outdated or low-confidence entries
-4. Syncs to knowledge graph (if enabled)
-
-## Knowledge Graph (optional)
+## Knowledge Graph
 
 ```typescript
 import { Neo4jGraph } from '@bitwarelabs/bwmem/graph';
@@ -316,17 +395,88 @@ const graph = new Neo4jGraph({
   password: 'password',
 });
 
-const mem = new BwMem({
-  // ...
-  graph,
-});
+const mem = new BwMem({ /* ... */ graph });
 ```
 
-Automatically syncs facts and entities to Neo4j during consolidation.
+Facts are automatically synced to Neo4j as schema-constrained entity relationships.
+
+### Relationship Types
+
+| Type | Source Keys | Target Type |
+|------|-----------|-------------|
+| `NAMED` | name, nickname | name |
+| `WORKS_AT` | employer, company | organization |
+| `PREVIOUSLY_AT` | past_employer | organization |
+| `WORKS_AS` | job_title, role, profession | role |
+| `WORKS_ON` | current_project, project | project |
+| `LIVES_IN` | location, city, country | place |
+| `PREVIOUSLY_IN` | past_location | place |
+| `PARTNER_OF` | partner, wife, husband | person |
+| `PARENT_OF` | child, daughter, son | person |
+| `SIBLING_OF` | sibling, brother, sister | person |
+| `COLLEAGUE_OF` | colleague, coworker | person |
+| `FRIEND_OF` | friend | person |
+| `OWNS` | pet, pet_name | animal |
+| `ENJOYS` | interest, hobby, sport | activity |
+| `STUDIES` | field, major, degree | field |
+| `STUDIES_AT` | university, school | organization |
+| `AIMS_FOR` | goal, career_change | goal |
+| `RUNS` | business, partner_business | organization |
+| `LIKES` / `DISLIKES` | food, favorite / dislike, allergy | thing |
+
+Entity-scoped facts (e.g., `partner_job: chef`) create edges FROM that entity (e.g., `Erik → HAS_ROLE → chef`).
+
+### Entity Validation
+
+Not every fact value becomes a graph entity. The graph pipeline filters out:
+- Pure numbers and percentages
+- Phrases longer than 6 words
+- Descriptive text that isn't a named entity
+
+### Example Graph Output
+
+```
+User → NAMED → Frida (name)
+User → WORKS_AT → White Arkitekter (organization)
+User → WORKS_AS → architect (role)
+User → LIVES_IN → Helsingborg (place)
+User → PREVIOUSLY_IN → Gothenburg (place)
+User → PARTNER_OF → Erik (person)
+User → PARENT_OF → Saga (person)
+User → COLLEAGUE_OF → Anders (person)
+Erik → HAS_ROLE → chef (role)
+Erik → RUNS → Salta restaurant (organization)
+```
+
+## Consolidation
+
+Three-stage memory consolidation pipeline:
+
+### Episodic (on session end)
+
+When `session.end()` is called:
+1. Extracts patterns from the session (themes, mood shifts, key moments, preference signals)
+2. Generates a conversation summary with embedding
+3. Stores patterns in `episodic_patterns` table
+
+### Daily (cron or manual)
+
+Runs at 2 AM by default:
+1. Aggregates recent episodic patterns into semantic knowledge
+2. Merges with existing knowledge (preferences, known facts, behavioral baselines)
+3. Expires old behavioral observations
+
+### Weekly (cron or manual)
+
+Runs at 3 AM Sundays by default:
+1. Reviews all semantic knowledge for consistency
+2. Cross-references with stored facts
+3. Prunes outdated or low-confidence entries
+4. Syncs to knowledge graph (if enabled)
 
 ## Database
 
-The SDK auto-creates all tables on `initialize()` via migrations. Tables are prefixed with `bwmem_` by default (configurable via `tablePrefix`).
+The SDK auto-creates all tables on `initialize()` via migrations. Tables are prefixed with `bwmem_` by default.
 
 **Core tables:**
 | Table | Purpose |
@@ -339,75 +489,35 @@ The SDK auto-creates all tables on `initialize()` via migrations. Tables are pre
 **Resonant memory:**
 | Table | Purpose |
 |---|---|
-| `emotional_moments` | High-emotion messages (valence > 0.5 or arousal > 0.6) |
-| `contradiction_signals` | Conflicts between user statements and stored facts |
+| `emotional_moments` | High-emotion messages with descriptive tags |
+| `contradiction_signals` | Behavioral and factual contradictions |
 | `behavioral_observations` | Behavioral pattern observations |
 
 **Consolidation:**
 | Table | Purpose |
 |---|---|
 | `consolidation_runs` | Audit log of all consolidation jobs |
-| `episodic_patterns` | Patterns extracted per session (themes, key moments) |
-| `semantic_knowledge` | Long-term aggregated knowledge from daily consolidation |
+| `episodic_patterns` | Patterns extracted per session |
+| `semantic_knowledge` | Long-term aggregated knowledge |
 
-## Examples
+**API layer (v0.2.0):**
+| Table | Purpose |
+|---|---|
+| `api_tenants` | Tenant accounts with API keys and tier limits |
+| `api_usage` | Per-tenant usage tracking |
 
-### CLI Chatbot
+## Security (API layer)
 
-Interactive terminal chatbot with memory. Auto-detects provider from environment variables.
-
-```bash
-# With OpenAI
-OPENAI_API_KEY=sk-... npx tsx examples/cli-chatbot/index.ts
-
-# With Ollama (local)
-OLLAMA_BASE_URL=http://localhost:11434 npx tsx examples/cli-chatbot/index.ts
-
-# With OpenRouter
-OPENROUTER_API_KEY=sk-or-... npx tsx examples/cli-chatbot/index.ts
-```
-
-Commands: `/facts` to show extracted facts, `/quit` to exit.
-
-### HTTP Chatbot
-
-Multi-user HTTP chatbot with session management.
-
-```bash
-OPENAI_API_KEY=sk-... npx tsx examples/express-chatbot/index.ts
-
-# Send a message
-curl -X POST http://localhost:3030/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"userId":"demo","message":"My name is Alice and I love hiking"}'
-
-# Get facts
-curl http://localhost:3030/facts/demo
-```
-
-### Basic Usage
-
-Shows the core API flow: init, session, messages, facts, context, search.
-
-```bash
-OPENAI_API_KEY=sk-... npx tsx examples/basic/index.ts
-```
-
-## Testing
-
-```bash
-# Unit tests (no external services needed)
-npm test
-
-# Install test — spins up Postgres + Redis via Docker, installs from tarball, verifies all exports
-./scripts/install-test.sh path/to/bitwarelabs-bwmem-*.tgz
-
-# Real LLM integration test (33 assertions with OpenRouter)
-./scripts/test-real-llm.sh path/to/tarball your-openrouter-key
-
-# 50-message consolidation test (3 sessions, episodic + daily consolidation)
-./scripts/test-consolidation.sh path/to/tarball your-openrouter-key
-```
+- API key auth with HMAC-SHA256 hashing and server-side pepper
+- Timing-safe admin key comparison
+- Tenant data isolation via userId prefixing
+- Per-tenant rate limiting (Redis-backed, tier-aware)
+- Bounded auth cache with automatic invalidation
+- Rate limiter fails closed on Redis failure
+- CORS allowlist in production, Swagger disabled in production
+- Request body size limit (1MB), session cap per tenant
+- Non-root Docker container, localhost-only DB ports
+- Security headers via nginx (HSTS, CSP, X-Frame-Options)
 
 ## Architecture
 
@@ -422,9 +532,10 @@ Session.recordMessage()
     └──▶ Background processing (fire-and-forget)
            ├── Generate embedding → store with pgvector
            ├── Sentiment analysis (VAD) → store scores
-           ├── Fact extraction (every 3 msgs) → store/update facts
-           ├── Contradiction check → flag conflicts
-           ├── Emotional moment capture → store if high emotion
+           ├── Fact extraction (every 3 msgs) → dedup → store facts
+           ├── LLM contradiction detection → flag conflicts
+           ├── Emotional moment capture → descriptive tagging
+           ├── Graph sync → entities + relationships → Neo4j
            └── Update session centroid
 
 Session.end()
@@ -432,14 +543,6 @@ Session.end()
     └──▶ Episodic consolidation (BullMQ job)
            ├── Extract patterns (themes, moments, preferences)
            └── Generate conversation summary with embedding
-
-Daily Consolidation (cron / manual)
-    │
-    └──▶ Aggregate episodic patterns → semantic knowledge
-
-Weekly Consolidation (cron / manual)
-    │
-    └──▶ Review, prune, and sync semantic knowledge
 
 buildContext()
     │
@@ -452,12 +555,20 @@ buildContext()
            ├── Behavioral observations
            ├── Episodic patterns
            ├── Semantic knowledge
-           └── Graph context (optional)
+           └── Graph context (Neo4j)
            │
            ▼
          MemoryContext.formatted → inject into LLM system prompt
 ```
 
+## Testing
+
+```bash
+npm test              # Unit tests (no external services needed)
+npm run build         # TypeScript compilation
+npm run start:api     # Start the REST API server
+```
+
 ## License
 
-MIT
+AGPL-3.0-only
