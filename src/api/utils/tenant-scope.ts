@@ -14,6 +14,9 @@ const SEP = ':';
 
 /** Scope a userId to a tenant: t_{tenantId}:{userId} */
 export function scopeUserId(tenantId: string, userId: string): string {
+  if (tenantId.includes(SEP)) {
+    throw new Error(`tenantId must not contain separator '${SEP}'`);
+  }
   return `${PREFIX}${tenantId}${SEP}${userId}`;
 }
 

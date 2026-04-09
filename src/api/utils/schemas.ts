@@ -29,8 +29,8 @@ export const recordMessageSchema = z.object({
 // ---- Context ----
 
 export const contextQuerySchema = z.object({
-  userId: z.string().min(1),
-  query: z.string().optional(),
+  userId: z.string().min(1).max(255),
+  query: z.string().max(30_000).optional(),
   sessionId: z.string().uuid().optional(),
   maxFacts: z.coerce.number().int().positive().max(100).optional(),
   maxSimilarMessages: z.coerce.number().int().positive().max(50).optional(),
@@ -42,8 +42,8 @@ export const contextQuerySchema = z.object({
 // ---- Search ----
 
 export const searchQuerySchema = z.object({
-  userId: z.string().min(1),
-  query: z.string().min(1),
+  userId: z.string().min(1).max(255),
+  query: z.string().min(1).max(5_000),
   type: z.enum(['messages', 'conversations']).default('messages'),
   limit: z.coerce.number().int().positive().max(50).optional(),
   threshold: z.coerce.number().min(0).max(1).optional(),
@@ -52,14 +52,14 @@ export const searchQuerySchema = z.object({
 // ---- Facts ----
 
 export const factsParamsSchema = z.object({
-  userId: z.string().min(1),
+  userId: z.string().min(1).max(255),
 });
 
 export const storeFactSchema = z.object({
   userId: z.string().min(1).max(255),
-  category: z.string().min(1),
-  key: z.string().min(1),
-  value: z.string().min(1),
+  category: z.string().min(1).max(100),
+  key: z.string().min(1).max(255),
+  value: z.string().min(1).max(10_000),
   confidence: z.number().min(0).max(1).optional(),
   factType: z.enum(['permanent', 'default', 'temporary']).optional(),
   validFrom: z.string().datetime().optional(),
@@ -76,13 +76,13 @@ export const deleteFactBodySchema = z.object({
 }).optional();
 
 export const searchFactsQuerySchema = z.object({
-  query: z.string().min(1),
+  query: z.string().min(1).max(1_000),
 });
 
 // ---- Emotions ----
 
 export const emotionsParamsSchema = z.object({
-  userId: z.string().min(1),
+  userId: z.string().min(1).max(255),
 });
 
 export const emotionsQuerySchema = z.object({
@@ -93,7 +93,7 @@ export const emotionsQuerySchema = z.object({
 // ---- Contradictions ----
 
 export const contradictionsParamsSchema = z.object({
-  userId: z.string().min(1),
+  userId: z.string().min(1).max(255),
 });
 
 export const contradictionsQuerySchema = z.object({
@@ -116,7 +116,42 @@ export const summaryParamsSchema = z.object({
 // ---- Graph ----
 
 export const graphParamsSchema = z.object({
-  userId: z.string().min(1),
+  userId: z.string().min(1).max(255),
+});
+
+// ---- Auth (self-service) ----
+
+export const registerSchema = z.object({
+  name: z.string().min(1).max(255),
+  email: z.string().email().max(255),
+  tier: z.enum(['tester', 'hobby']).default('tester'),
+});
+
+export const magicLinkRequestSchema = z.object({
+  email: z.string().email().max(255),
+});
+
+export const verifyTokenSchema = z.object({
+  token: z.string().min(30).max(200),
+});
+
+// ---- Account (self-service) ----
+
+export const addIpAllowlistSchema = z.object({
+  cidr: z.string().min(7).max(43).regex(
+    /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$|^[0-9a-fA-F:]+\/\d{1,3}$/,
+    'Must be valid CIDR notation (e.g., 192.168.1.0/24)',
+  ),
+  label: z.string().max(100).optional(),
+});
+
+export const removeIpAllowlistParamsSchema = z.object({
+  id: z.string().uuid(),
+});
+
+export const auditLogQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(100).default(50),
+  offset: z.coerce.number().int().min(0).default(0),
 });
 
 // ---- Admin ----

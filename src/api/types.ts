@@ -7,6 +7,7 @@ import type { Session } from '../session/session.js';
 
 export interface ApiTenant {
   id: string;
+  isAdmin?: boolean;
   name: string;
   email: string;
   apiKeyHash: string;
@@ -16,6 +17,11 @@ export interface ApiTenant {
   maxEmbeddingsPerMonth: number;
   rateLimitPerMinute: number;
   isActive: boolean;
+  emailVerified: boolean;
+  emailVerifiedAt: Date | null;
+  registrationSource: 'admin' | 'self_service';
+  prevApiKeyHash: string | null;
+  prevKeyExpiresAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }

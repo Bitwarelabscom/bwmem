@@ -14,7 +14,7 @@ export async function consolidationRoutes(
 
   // POST /consolidate — trigger daily or weekly consolidation (admin-only #8)
   app.post('/consolidate', async (request: FastifyRequest, _reply) => {
-    if (request.tenant?.id !== 'admin') {
+    if (!request.tenant?.isAdmin) {
       throw new ForbiddenError('Admin access required');
     }
 

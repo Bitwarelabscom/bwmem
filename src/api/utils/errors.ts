@@ -47,3 +47,15 @@ export class ValidationError extends ApiError {
     super(400, message, 'VALIDATION_ERROR');
   }
 }
+
+export class ConflictError extends ApiError {
+  constructor(message = 'Resource already exists') {
+    super(409, message, 'CONFLICT');
+  }
+}
+
+export class TooManyRequestsError extends ApiError {
+  constructor(message = 'Too many requests, try again later') {
+    super(429, message, 'TOO_MANY_REQUESTS');
+  }
+}

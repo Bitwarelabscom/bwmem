@@ -77,7 +77,7 @@ export function createUsageMiddleware(pg: PgClient, tablePrefix: string, logger:
   /** preHandler: check embedding quota and set response headers */
   async function quotaCheck(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const tenant = request.tenant;
-    if (!tenant || tenant.id === 'admin') return;
+    if (!tenant || tenant.isAdmin) return;
 
     const used = await getMonthlyEmbeddingTokens(tenant.id);
     const remaining = Math.max(0, tenant.maxEmbeddingsPerMonth - used);
@@ -93,7 +93,7 @@ export function createUsageMiddleware(pg: PgClient, tablePrefix: string, logger:
   /** onResponse: record usage */
   async function recordUsage(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     const tenant = request.tenant;
-    if (!tenant || tenant.id === 'admin') return;
+    if (!tenant || tenant.isAdmin) return;
 
     buffer.push({
       tenantId: tenant.id,

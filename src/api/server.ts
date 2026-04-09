@@ -25,14 +25,19 @@ import { consolidationRoutes } from './routes/consolidation.js';
 import { summaryRoutes } from './routes/summary.js';
 import { graphRoutes } from './routes/graph.js';
 import { adminRoutes } from './routes/admin.js';
+import { authRoutes } from './routes/auth.js';
+import { accountRoutes } from './routes/account.js';
+import { createAuditService } from './services/audit.js';
+import { createEmailService } from './services/email.js';
+import { createMagicLinkService } from './services/magic-link.js';
 import type { ManagedSession } from './types.js';
 import type { Logger } from '../types.js';
 
 // ---- Config from env ----
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
-const DATABASE_URL = process.env.DATABASE_URL ?? 'postgresql://bwmem:bwmem@localhost:5432/bwmem';
-const REDIS_URL = process.env.REDIS_URL ?? 'redis://localhost:6379';
+const DATABASE_URL = process.env.DATABASE_URL ?? '';
+const REDIS_URL = process.env.REDIS_URL ?? '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY ?? '';
 const OPENROUTER_EMBEDDING_MODEL = process.env.OPENROUTER_EMBEDDING_MODEL ?? 'openai/text-embedding-3-small';
 const OPENROUTER_CHAT_MODEL = process.env.OPENROUTER_CHAT_MODEL ?? 'anthropic/claude-3.5-haiku';
@@ -45,14 +50,31 @@ const CORS_ORIGINS = process.env.CORS_ORIGINS; // comma-separated allowlist
 const NEO4J_URI = process.env.NEO4J_URI ?? '';
 const NEO4J_USER = process.env.NEO4J_USER ?? 'neo4j';
 const NEO4J_PASSWORD = process.env.NEO4J_PASSWORD ?? '';
+const MAIL_TRANSPORT = (process.env.MAIL_TRANSPORT ?? 'sendmail') as 'sendmail' | 'smtp';
+const MAIL_FROM = process.env.MAIL_FROM ?? 'noreply@bitwarelabs.com';
+const MAIL_BASE_URL = process.env.MAIL_BASE_URL ?? 'https://api.bitwarelabs.com';
+const MAIL_SMTP_HOST = process.env.MAIL_SMTP_HOST ?? '127.0.0.1';
+const MAIL_SMTP_PORT = parseInt(process.env.MAIL_SMTP_PORT ?? '587', 10);
+const MAIL_SMTP_SECURE = process.env.MAIL_SMTP_SECURE === 'true';
+const MAIL_SMTP_TLS_REJECT = process.env.MAIL_SMTP_TLS_REJECT_UNAUTHORIZED !== 'false';
+const KEY_ROTATION_GRACE_HOURS = parseInt(process.env.KEY_ROTATION_GRACE_HOURS ?? '24', 10);
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 // ---- Startup validation (#2) ----
 
 function validateConfig(): void {
+  if (!DATABASE_URL) {
+    throw new Error('DATABASE_URL must be set');
+  }
+  if (!REDIS_URL) {
+    throw new Error('REDIS_URL must be set');
+  }
   if (!ADMIN_API_KEY || ADMIN_API_KEY.length < 32) {
     throw new Error('ADMIN_API_KEY must be set and at least 32 characters');
+  }
+  if (!/^[a-z_][a-z0-9_]*$/i.test(TABLE_PREFIX)) {
+    throw new Error('TABLE_PREFIX must contain only alphanumeric characters and underscores');
   }
 }
 
@@ -65,6 +87,7 @@ export async function buildApp(): Promise<{
   redis: RedisClient;
   trackedEmbed: TrackedEmbeddingProvider;
   usageMw: ReturnType<typeof createUsageMiddleware>;
+  auditService: ReturnType<typeof createAuditService>;
   activeSessions: Map<string, ManagedSession>;
 }> {
   validateConfig();
@@ -161,6 +184,11 @@ export async function buildApp(): Promise<{
 
   // ---- Plugins ----
 
+  // Security headers
+  await app.register(import('@fastify/helmet'), {
+    contentSecurityPolicy: IS_PRODUCTION ? undefined : false, // Disable CSP in dev for Swagger UI
+  });
+
   // CORS — explicit origin allowlist in production (#6)
   await app.register(import('@fastify/cors'), {
     origin: CORS_ORIGINS ? CORS_ORIGINS.split(',').map(s => s.trim()) : !IS_PRODUCTION,
@@ -201,8 +229,109 @@ export async function buildApp(): Promise<{
   // Usage middleware
   const usageMw = createUsageMiddleware(apiPg, TABLE_PREFIX, sdkLogger);
 
+  // User management services
+  const auditService = createAuditService(apiPg, TABLE_PREFIX, sdkLogger);
+  const emailService = createEmailService({
+    transport: MAIL_TRANSPORT,
+    smtpHost: MAIL_SMTP_HOST,
+    smtpPort: MAIL_SMTP_PORT,
+    smtpSecure: MAIL_SMTP_SECURE,
+    smtpTlsRejectUnauthorized: MAIL_SMTP_TLS_REJECT,
+    from: MAIL_FROM,
+    baseUrl: MAIL_BASE_URL,
+    logger: sdkLogger,
+  });
+  const magicLinkService = createMagicLinkService(apiPg, redis, TABLE_PREFIX, sdkLogger);
+
+  // Periodic cleanup: expired magic link tokens (hourly)
+  const tokenCleanupInterval = setInterval(() => void magicLinkService.cleanupExpired(), 60 * 60 * 1000);
+  tokenCleanupInterval.unref();
+
+  // Periodic cleanup: expired grace-period keys (every 5 min)
+  const graceKeyCleanupInterval = setInterval(async () => {
+    try {
+      await apiPg.query(
+        `UPDATE ${TABLE_PREFIX}api_tenants
+         SET prev_api_key_hash = NULL, prev_key_expires_at = NULL
+         WHERE prev_key_expires_at IS NOT NULL AND prev_key_expires_at < NOW()`,
+      );
+    } catch (err) {
+      sdkLogger.error('Failed to clean expired grace keys', { error: (err as Error).message });
+    }
+  }, 5 * 60 * 1000);
+  graceKeyCleanupInterval.unref();
+
+  // ---- Landing page ----
+
+  app.get('/', async (_request, reply) => {
+    reply.type('text/html');
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bwmem API — BitwareLabs</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .container{max-width:540px;padding:2rem;text-align:center}
+  h1{font-size:2.4rem;font-weight:700;letter-spacing:-0.02em;margin-bottom:0.25rem}
+  h1 span{color:#6366f1}
+  .tagline{color:#888;font-size:1.05rem;margin-bottom:2rem}
+  .version{display:inline-block;background:#1a1a2e;color:#6366f1;padding:0.2rem 0.7rem;border-radius:999px;font-size:0.8rem;font-weight:600;margin-bottom:2rem}
+  .links{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;margin-bottom:2rem}
+  .links a{color:#6366f1;text-decoration:none;padding:0.5rem 1.2rem;border:1px solid #6366f1;border-radius:8px;font-size:0.9rem;transition:all 0.15s}
+  .links a:hover{background:#6366f1;color:#fff}
+  .features{text-align:left;margin:2rem auto 0;max-width:380px}
+  .features li{padding:0.4rem 0;color:#aaa;font-size:0.9rem;list-style:none}
+  .features li::before{content:'→ ';color:#6366f1}
+  footer{margin-top:2.5rem;color:#555;font-size:0.8rem}
+  footer a{color:#666;text-decoration:none}
+  footer a:hover{color:#6366f1}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1><span>bw</span>mem</h1>
+  <p class="tagline">Memory engine for AI chatbots</p>
+  <div class="links">
+    <a href="/api/v1/health">Health</a>
+    <a href="https://www.npmjs.com/package/@bitwarelabs/bwmem">npm</a>
+    <a href="https://github.com/bitwarelabscom/bwmem">GitHub</a>
+  </div>
+  <ul class="features">
+    <li>Semantic search with pgvector embeddings</li>
+    <li>Fact extraction &amp; contradiction detection</li>
+    <li>Emotional moment capture</li>
+    <li>Session-scoped context building</li>
+    <li>Knowledge graph (Neo4j)</li>
+    <li>Automatic memory consolidation</li>
+  </ul>
+  <footer>&copy; ${new Date().getFullYear()} <a href="https://bitwarelabs.com">BitwareLabs</a></footer>
+</div>
+</body>
+</html>`;
+  });
+
   // ---- Routes ----
 
+  // Public auth routes (no API key required, rate-limited by IP)
+  await app.register(
+    async (publicApi) => {
+      await registerRateLimiter(publicApi, redis);
+      await publicApi.register(
+        (sub, _opts) => authRoutes(sub, {
+          pg: apiPg, tablePrefix: TABLE_PREFIX,
+          magicLink: magicLinkService, email: emailService,
+          audit: auditService, baseUrl: MAIL_BASE_URL,
+        }),
+        { prefix: '/auth' },
+      );
+    },
+    { prefix: '/api/v1' },
+  );
+
+  // Authenticated API routes
   await app.register(
     async (api) => {
       // Auth on all v1 routes
@@ -213,7 +342,7 @@ export async function buildApp(): Promise<{
 
       // Tenant context via AsyncLocalStorage.run() (#16) + usage quota check
       api.addHook('preHandler', async (request, reply) => {
-        if (request.tenant && request.tenant.id !== 'admin') {
+        if (request.tenant && !request.tenant.isAdmin) {
           await tenantStore.run({ tenantId: request.tenant.id }, () =>
             usageMw.quotaCheck(request, reply),
           );
@@ -280,22 +409,32 @@ export async function buildApp(): Promise<{
         (sub, _opts) => graphRoutes(sub, { graph: graphPlugin }),
       );
 
+      // Account (self-service)
+      await api.register(
+        (sub, _opts) => accountRoutes(sub, {
+          pg: apiPg, tablePrefix: TABLE_PREFIX,
+          invalidateTenant, audit: auditService,
+          email: emailService, graceHours: KEY_ROTATION_GRACE_HOURS,
+        }),
+        { prefix: '/account' },
+      );
+
       // Admin routes
       await api.register(
-        (sub, _opts) => adminRoutes(sub, { pg: apiPg, tablePrefix: TABLE_PREFIX, invalidateTenant }),
+        (sub, _opts) => adminRoutes(sub, { pg: apiPg, tablePrefix: TABLE_PREFIX, invalidateTenant, audit: auditService }),
         { prefix: '/admin' },
       );
     },
     { prefix: '/api/v1' },
   );
 
-  return { app, bwmem, apiPg, redis, trackedEmbed, usageMw, activeSessions };
+  return { app, bwmem, apiPg, redis, trackedEmbed, usageMw, auditService, activeSessions };
 }
 
 // ---- Start server ----
 
 export async function startServer(): Promise<void> {
-  const { app, bwmem, apiPg, trackedEmbed, usageMw, activeSessions } = await buildApp();
+  const { app, bwmem, apiPg, trackedEmbed, usageMw, auditService, activeSessions } = await buildApp();
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
@@ -311,6 +450,7 @@ export async function startServer(): Promise<void> {
     }
     activeSessions.clear();
 
+    await auditService.shutdown();
     await usageMw.shutdown();
     await trackedEmbed.shutdown();
     await bwmem.shutdown();

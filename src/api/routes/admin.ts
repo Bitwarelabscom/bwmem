@@ -5,19 +5,20 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { PgClient } from '../../db/postgres.js';
 import type { TenantTier } from '../types.js';
 import { TIER_DEFAULTS } from '../types.js';
-import { createTenantSchema, updateTenantSchema, tenantIdParamsSchema } from '../utils/schemas.js';
+import { createTenantSchema, updateTenantSchema, tenantIdParamsSchema, auditLogQuerySchema } from '../utils/schemas.js';
 import { generateApiKey } from '../utils/api-keys.js';
 import { ForbiddenError } from '../utils/errors.js';
+import type { AuditService } from '../services/audit.js';
 
 export async function adminRoutes(
   app: FastifyInstance,
-  opts: { pg: PgClient; tablePrefix: string; invalidateTenant?: (tenantId: string) => void },
+  opts: { pg: PgClient; tablePrefix: string; invalidateTenant?: (tenantId: string) => void; audit?: AuditService },
 ): Promise<void> {
-  const { pg, tablePrefix, invalidateTenant } = opts;
+  const { pg, tablePrefix, invalidateTenant, audit } = opts;
 
   // Admin-only guard
   app.addHook('preHandler', async (request) => {
-    if (request.tenant?.id !== 'admin') {
+    if (!request.tenant?.isAdmin) {
       throw new ForbiddenError('Admin access required');
     }
   });
@@ -29,12 +30,25 @@ export async function adminRoutes(
     const defaults = TIER_DEFAULTS[tier];
     const { key, hash, prefix } = generateApiKey();
 
-    await pg.query(
+    const rows = await pg.query<{ id: string }>(
       `INSERT INTO ${tablePrefix}api_tenants
-        (name, email, api_key_hash, api_key_prefix, tier, max_users, max_embeddings_per_month, rate_limit_per_minute)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        (name, email, api_key_hash, api_key_prefix, tier, max_users,
+         max_embeddings_per_month, rate_limit_per_minute,
+         email_verified, email_verified_at, registration_source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW(), 'admin')
+       RETURNING id`,
       [body.name, body.email, hash, prefix, tier, defaults.maxUsers, defaults.maxEmbeddingsPerMonth, defaults.rateLimitPerMinute],
     );
+
+    if (audit && rows.length > 0) {
+      audit.log({
+        tenantId: rows[0].id,
+        eventType: 'admin_create_tenant',
+        ip: request.ip,
+        userAgent: request.headers['user-agent'] ?? null,
+        details: { tier, name: body.name, email: body.email },
+      });
+    }
 
     return {
       success: true,
@@ -48,8 +62,9 @@ export async function adminRoutes(
     };
   });
 
-  // GET /admin/tenants — list all tenants
-  app.get('/tenants', async (_request, _reply) => {
+  // GET /admin/tenants — list all tenants (paginated)
+  app.get('/tenants', async (request: FastifyRequest, _reply) => {
+    const query = auditLogQuerySchema.parse(request.query); // reuse limit/offset schema
     const rows = await pg.query<{
       id: string; name: string; email: string; api_key_prefix: string;
       tier: string; max_users: number; max_embeddings_per_month: number;
@@ -59,7 +74,9 @@ export async function adminRoutes(
       `SELECT id, name, email, api_key_prefix, tier, max_users,
               max_embeddings_per_month, rate_limit_per_minute,
               is_active, created_at, updated_at
-       FROM ${tablePrefix}api_tenants ORDER BY created_at DESC`,
+       FROM ${tablePrefix}api_tenants ORDER BY created_at DESC
+       LIMIT $1 OFFSET $2`,
+      [query.limit, query.offset],
     );
 
     return {
@@ -105,6 +122,16 @@ export async function adminRoutes(
 
     // Invalidate auth cache so changes take effect immediately (#3)
     if (invalidateTenant) invalidateTenant(id);
+
+    if (audit) {
+      audit.log({
+        tenantId: id,
+        eventType: 'admin_update_tenant',
+        ip: request.ip,
+        userAgent: request.headers['user-agent'] ?? null,
+        details: body as Record<string, unknown>,
+      });
+    }
 
     return { success: true, data: { updated: true } };
   });

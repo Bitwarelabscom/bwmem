@@ -4,7 +4,11 @@
 import { randomBytes, createHmac } from 'node:crypto';
 
 const KEY_PREFIX = 'bwm_sk_';
-const PEPPER = process.env.API_KEY_PEPPER ?? 'bwmem-default-pepper';
+const _pepper = process.env.API_KEY_PEPPER;
+if (!_pepper || _pepper.length < 32) {
+  throw new Error('API_KEY_PEPPER must be set and at least 32 characters');
+}
+const PEPPER: string = _pepper;
 
 export function generateApiKey(): { key: string; hash: string; prefix: string } {
   const raw = randomBytes(32).toString('base64url');

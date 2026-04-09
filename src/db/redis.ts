@@ -16,6 +16,8 @@ export class RedisClient {
       this.client = new (RedisConstructor as typeof Redis.default)(config, {
         maxRetriesPerRequest: 3,
         retryStrategy: (times: number) => Math.min(times * 50, 2000),
+        // TLS is auto-enabled for rediss:// URLs by ioredis
+        tls: config.startsWith('rediss://') ? { rejectUnauthorized: true } : undefined,
       });
     } else {
       this.client = new (RedisConstructor as typeof Redis.default)({

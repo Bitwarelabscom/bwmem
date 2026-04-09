@@ -7,10 +7,12 @@ import type { PgClient } from '../../db/postgres.js';
 import type { Logger } from '../../types.js';
 import type { ApiTenant } from '../types.js';
 import { hashApiKey, isValidKeyFormat } from '../utils/api-keys.js';
-import { UnauthorizedError } from '../utils/errors.js';
+import { UnauthorizedError, ForbiddenError } from '../utils/errors.js';
+import { isIpAllowed } from '../utils/ip.js';
 
 interface CacheEntry {
   tenant: ApiTenant;
+  ipAllowlist: string[];
   expiresAt: number;
 }
 
@@ -55,7 +57,8 @@ export function createAuthHook(pg: PgClient, tablePrefix: string, logger: Logger
     // Check for admin key — constant-time comparison (#1)
     if (adminApiKey && constantTimeCompare(key, adminApiKey)) {
       request.tenant = {
-        id: 'admin',
+        id: '__admin__',
+        isAdmin: true,
         name: 'Admin',
         email: 'admin@internal',
         apiKeyHash: '',
@@ -65,6 +68,11 @@ export function createAuthHook(pg: PgClient, tablePrefix: string, logger: Logger
         maxEmbeddingsPerMonth: 999_999_999,
         rateLimitPerMinute: 600,
         isActive: true,
+        emailVerified: true,
+        emailVerifiedAt: new Date(),
+        registrationSource: 'admin',
+        prevApiKeyHash: null,
+        prevKeyExpiresAt: null,
         createdAt: new Date(),
         updatedAt: new Date(),
       };
@@ -81,33 +89,72 @@ export function createAuthHook(pg: PgClient, tablePrefix: string, logger: Logger
     const cached = cache.get(keyHash);
     if (cached) {
       if (cached.expiresAt > Date.now()) {
+        // IP allowlist check (fast path from cache)
+        if (!isIpAllowed(request.ip, cached.ipAllowlist)) {
+          throw new ForbiddenError('Request IP not in allowlist');
+        }
         request.tenant = cached.tenant;
         return;
       }
       cache.delete(keyHash);
     }
 
-    // DB lookup
-    const row = await pg.queryOne<{
-      id: string;
-      name: string;
-      email: string;
-      api_key_hash: string;
-      api_key_prefix: string;
-      tier: string;
-      max_users: number;
-      max_embeddings_per_month: number;
-      rate_limit_per_minute: number;
-      is_active: boolean;
-      created_at: Date;
-      updated_at: Date;
-    }>(
-      `SELECT * FROM ${tablePrefix}api_tenants WHERE api_key_hash = $1 AND is_active = TRUE`,
-      [keyHash],
-    );
+    // DB lookup — includes grace-period key for rotation
+    const [row, allowlistRows] = await Promise.all([
+      pg.queryOne<{
+        id: string;
+        name: string;
+        email: string;
+        api_key_hash: string;
+        api_key_prefix: string;
+        tier: string;
+        max_users: number;
+        max_embeddings_per_month: number;
+        rate_limit_per_minute: number;
+        is_active: boolean;
+        email_verified: boolean;
+        email_verified_at: Date | null;
+        registration_source: string;
+        prev_api_key_hash: string | null;
+        prev_key_expires_at: Date | null;
+        created_at: Date;
+        updated_at: Date;
+      }>(
+        `SELECT id, name, email, api_key_hash, api_key_prefix, tier,
+                max_users, max_embeddings_per_month, rate_limit_per_minute,
+                is_active, email_verified, email_verified_at,
+                registration_source, prev_api_key_hash, prev_key_expires_at,
+                created_at, updated_at
+         FROM ${tablePrefix}api_tenants
+         WHERE is_active = TRUE
+           AND (api_key_hash = $1
+                OR (prev_api_key_hash = $1 AND prev_key_expires_at > NOW()))`,
+        [keyHash],
+      ),
+      pg.query<{ cidr: string }>(
+        `SELECT al.cidr FROM ${tablePrefix}tenant_ip_allowlist al
+         INNER JOIN ${tablePrefix}api_tenants t ON al.tenant_id = t.id
+         WHERE t.is_active = TRUE
+           AND (t.api_key_hash = $1
+                OR (t.prev_api_key_hash = $1 AND t.prev_key_expires_at > NOW()))`,
+        [keyHash],
+      ),
+    ]);
 
     if (!row) {
       throw new UnauthorizedError();
+    }
+
+    // Email verification check
+    if (!row.email_verified) {
+      throw new ForbiddenError('Email not verified. Check your inbox for the verification link.');
+    }
+
+    const ipAllowlist = allowlistRows.map(r => r.cidr);
+
+    // IP allowlist check
+    if (!isIpAllowed(request.ip, ipAllowlist)) {
+      throw new ForbiddenError('Request IP not in allowlist');
     }
 
     const tenant: ApiTenant = {
@@ -121,6 +168,11 @@ export function createAuthHook(pg: PgClient, tablePrefix: string, logger: Logger
       maxEmbeddingsPerMonth: row.max_embeddings_per_month,
       rateLimitPerMinute: row.rate_limit_per_minute,
       isActive: row.is_active,
+      emailVerified: row.email_verified,
+      emailVerifiedAt: row.email_verified_at,
+      registrationSource: row.registration_source as ApiTenant['registrationSource'],
+      prevApiKeyHash: row.prev_api_key_hash,
+      prevKeyExpiresAt: row.prev_key_expires_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     };
@@ -131,7 +183,7 @@ export function createAuthHook(pg: PgClient, tablePrefix: string, logger: Logger
       if (oldest !== undefined) cache.delete(oldest);
     }
 
-    cache.set(keyHash, { tenant, expiresAt: Date.now() + CACHE_TTL_MS });
+    cache.set(keyHash, { tenant, ipAllowlist, expiresAt: Date.now() + CACHE_TTL_MS });
     request.tenant = tenant;
 
     logger.debug('Authenticated tenant', { tenantId: tenant.id, tier: tenant.tier });

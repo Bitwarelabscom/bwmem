@@ -9,7 +9,14 @@ export class PgClient {
     this.logger = logger;
 
     const poolConfig: PoolConfig = typeof config === 'string'
-      ? { connectionString: config, max: 20, idleTimeoutMillis: 30000, connectionTimeoutMillis: 2000 }
+      ? {
+          connectionString: config,
+          max: 20,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 2000,
+          // Enable SSL if sslmode is set in the connection string or via env
+          ssl: config.includes('sslmode=') ? undefined : (process.env.PGSSLMODE === 'require' ? { rejectUnauthorized: true } : undefined),
+        }
       : { host: config.host, port: config.port ?? 5432, user: config.user, password: config.password, database: config.database, ssl: config.ssl, max: config.max ?? 20, idleTimeoutMillis: 30000, connectionTimeoutMillis: 2000 };
 
     this.pool = new Pool(poolConfig);
