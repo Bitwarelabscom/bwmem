@@ -61,13 +61,27 @@ export interface SessionOptions {
   inactivityTimeoutMs?: number;  // default 300000 (5 min)
 }
 
+/**
+ * Optional context passed to every graph plugin method.
+ *
+ * Historically, bwmem scoped userIds as `t_{tenantId}:{userId}` strings so
+ * multi-tenant graph stores could derive isolation boundaries from the
+ * userId. That scheme still works, but it is fragile — a plugin had to
+ * reverse-engineer the format. The explicit `tenantId` here lets a plugin
+ * enforce isolation without string parsing. Implementations that do not
+ * care about tenancy can ignore it.
+ */
+export interface GraphPluginContext {
+  tenantId?: string;
+}
+
 export interface GraphPlugin {
   initialize(): Promise<void>;
   shutdown(): Promise<void>;
-  syncFact(userId: string, fact: Fact): Promise<void>;
-  syncEntity(userId: string, entity: EntityNode): Promise<void>;
-  getContext(userId: string): Promise<string | null>;
-  getStats(userId: string): Promise<GraphStats | null>;
+  syncFact(userId: string, fact: Fact, ctx?: GraphPluginContext): Promise<void>;
+  syncEntity(userId: string, entity: EntityNode, ctx?: GraphPluginContext): Promise<void>;
+  getContext(userId: string, ctx?: GraphPluginContext): Promise<string | null>;
+  getStats(userId: string, ctx?: GraphPluginContext): Promise<GraphStats | null>;
 }
 
 export interface Logger {
@@ -79,8 +93,18 @@ export interface Logger {
 
 // ---- Facts ----
 
-export type FactCategory = 'personal' | 'work' | 'preference' | 'hobby'
-  | 'relationship' | 'goal' | 'context' | (string & {});
+/** The well-known fact categories extracted by the built-in fact extractor. */
+export type KnownFactCategory = 'personal' | 'work' | 'preference' | 'hobby'
+  | 'relationship' | 'goal' | 'context';
+
+/**
+ * Fact category. Callers usually use one of the well-known values, but
+ * storing a custom category string is allowed. The explicit union with
+ * `string` keeps autocomplete for the canonical values while not blocking
+ * extension — unlike the previous `(string & {})` hack which silently
+ * accepted any string without signalling intent.
+ */
+export type FactCategory = KnownFactCategory | string;
 
 export type FactStatus = 'active' | 'overridden' | 'superseded' | 'expired';
 export type FactType = 'permanent' | 'default' | 'temporary';

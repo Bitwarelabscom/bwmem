@@ -84,39 +84,49 @@ export async function authRoutes(
   });
 
   // POST /auth/magic-link — request a magic link email
+  //
+  // Anti-enumeration: every branch returns the same generic message and all
+  // DB / email work is deferred to a background task, so the response time
+  // does not leak whether the email is registered.
   app.post('/magic-link', async (request: FastifyRequest, _reply) => {
     const body = magicLinkRequestSchema.parse(request.body);
 
-    // Rate limit by email (Redis)
+    // Rate limit by email (hash-based, constant-cost regardless of existence).
     const rateLimited = await magicLink.checkEmailRateLimit(body.email);
     if (rateLimited) {
       return { success: true, data: { message: GENERIC_CHECK_EMAIL } };
     }
 
-    const tenant = await pg.queryOne<{ id: string; name: string; is_active: boolean }>(
-      `SELECT id, name, is_active FROM ${tablePrefix}api_tenants WHERE email = $1`,
-      [body.email],
-    );
+    const ip = request.ip;
+    const userAgent = request.headers['user-agent'] ?? null;
 
-    if (!tenant || !tenant.is_active) {
-      return { success: true, data: { message: GENERIC_CHECK_EMAIL } };
-    }
+    // Fire-and-forget: any lookup / token / send work runs after the response
+    // is dispatched so legitimate and non-existent emails complete the
+    // request in indistinguishable time.
+    void (async () => {
+      try {
+        const tenant = await pg.queryOne<{ id: string; name: string; is_active: boolean }>(
+          `SELECT id, name, is_active FROM ${tablePrefix}api_tenants WHERE email = $1`,
+          [body.email],
+        );
+        if (!tenant || !tenant.is_active) return;
 
-    // Per-tenant rate limit (DB)
-    const recent = await magicLink.getRecentCount(tenant.id, 60);
-    if (recent >= 5) {
-      return { success: true, data: { message: GENERIC_CHECK_EMAIL } };
-    }
+        const recent = await magicLink.getRecentCount(tenant.id, 60);
+        if (recent >= 5) return;
 
-    const token = await magicLink.createToken(tenant.id, 'login', request.ip);
-    await email.sendMagicLinkEmail(body.email, token, tenant.name);
+        const token = await magicLink.createToken(tenant.id, 'login', ip);
+        await email.sendMagicLinkEmail(body.email, token, tenant.name);
 
-    audit.log({
-      tenantId: tenant.id,
-      eventType: 'login_request',
-      ip: request.ip,
-      userAgent: request.headers['user-agent'] ?? null,
-    });
+        audit.log({
+          tenantId: tenant.id,
+          eventType: 'login_request',
+          ip,
+          userAgent,
+        });
+      } catch (err) {
+        app.log.error(err, 'magic-link background task failed');
+      }
+    })();
 
     return { success: true, data: { message: GENERIC_CHECK_EMAIL } };
   });
@@ -203,19 +213,47 @@ export async function authRoutes(
     }
 
     if (result.purpose === 'verify_email') {
-      await pg.query(
-        `UPDATE ${tablePrefix}api_tenants
-         SET email_verified = TRUE, email_verified_at = NOW(), updated_at = NOW()
-         WHERE id = $1`,
+      // Look up whether this tenant was self-service or admin-created. For
+      // admin-created tenants the plaintext API key was already delivered
+      // at creation time, so verification only flips the flag. For self-
+      // service tenants the original plaintext was never revealed, so we
+      // regenerate a fresh key and return it here.
+      const existing = await pg.queryOne<{ registration_source: string; api_key_prefix: string }>(
+        `SELECT registration_source, api_key_prefix FROM ${tablePrefix}api_tenants WHERE id = $1`,
         [result.tenantId],
       );
+      const isAdminProvisioned = existing?.registration_source === 'admin';
 
-      // Regenerate key so we can reveal it (the original hash is stored but the
-      // plaintext key from registration is gone). Generate a fresh key.
+      if (isAdminProvisioned) {
+        await pg.query(
+          `UPDATE ${tablePrefix}api_tenants
+           SET email_verified = TRUE, email_verified_at = NOW(), updated_at = NOW()
+           WHERE id = $1`,
+          [result.tenantId],
+        );
+        audit.log({
+          tenantId: result.tenantId,
+          eventType: 'verify_email',
+          ip: request.ip,
+          userAgent: request.headers['user-agent'] ?? null,
+          details: { source: 'admin' },
+        });
+        return {
+          success: true,
+          data: {
+            verified: true,
+            // Admin already delivered the plaintext key; do not re-reveal.
+            apiKeyPrefix: existing?.api_key_prefix,
+          },
+        };
+      }
+
+      // Self-service: regenerate and reveal.
       const { key, hash, prefix } = generateApiKey();
       await pg.query(
         `UPDATE ${tablePrefix}api_tenants
-         SET api_key_hash = $1, api_key_prefix = $2, updated_at = NOW()
+         SET email_verified = TRUE, email_verified_at = NOW(),
+             api_key_hash = $1, api_key_prefix = $2, updated_at = NOW()
          WHERE id = $3`,
         [hash, prefix, result.tenantId],
       );
@@ -225,6 +263,7 @@ export async function authRoutes(
         eventType: 'verify_email',
         ip: request.ip,
         userAgent: request.headers['user-agent'] ?? null,
+        details: { source: 'self_service' },
       });
 
       return {

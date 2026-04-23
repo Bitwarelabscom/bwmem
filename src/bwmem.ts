@@ -26,43 +26,62 @@ import { ContextBuilder } from './memory/context-builder.js';
 import { SessionManager } from './session/session-manager.js';
 import { ConsolidationScheduler } from './consolidation/scheduler.js';
 import type { Session } from './session/session.js';
+import { BwMemStats, globalStats } from './stats.js';
+
+/**
+ * Services constructed during `initialize()`. Held in a single optional
+ * object so the type system enforces "must call initialize() first" — any
+ * access through `ensureReady()` returns the non-null bag, and accidental
+ * access before init throws a clean error rather than crashing with
+ * "Cannot read properties of undefined".
+ */
+interface Services {
+  pg: PgClient;
+  redis: RedisClient;
+  facts: FactsService;
+  embedding: EmbeddingService;
+  sentiment: SentimentService;
+  centroid: CentroidService;
+  emotionalMoments: EmotionalMomentsService;
+  contradictions: ContradictionService;
+  behavioral: BehavioralService;
+  summaries: SummariesService;
+  contextBuilder: ContextBuilder;
+  sessionManager: SessionManager;
+  scheduler: ConsolidationScheduler | null;
+}
 
 export class BwMem {
   private config: ResolvedConfig;
-  private pg!: PgClient;
-  private redis!: RedisClient;
-  private initialized = false;
+  private services: Services | null = null;
 
-  // Services (accessible after initialize)
-  private _facts!: FactsService;
-  private _embedding!: EmbeddingService;
-  private _sentiment!: SentimentService;
-  private _centroid!: CentroidService;
-  private _emotionalMoments!: EmotionalMomentsService;
-  private _contradictions!: ContradictionService;
-  private _behavioral!: BehavioralService;
-  private _summaries!: SummariesService;
-  private _contextBuilder!: ContextBuilder;
-  private _sessionManager!: SessionManager;
-  private _scheduler?: ConsolidationScheduler;
+  /**
+   * Counters for background-task failures. Incremented by fire-and-forget
+   * pipelines (graph sync, fact extraction, behavioral detection) when
+   * they catch errors. Exposed via `/health/detailed` so ops can detect
+   * silent degradation. Uses the shared `globalStats` singleton so
+   * services that lack a BwMem handle can still report.
+   */
+  readonly stats: BwMemStats = globalStats;
 
   constructor(config: BwMemConfig) {
     this.config = resolveConfig(config);
   }
 
+  /** Initialize DB connections, run migrations, and wire up services. */
   async initialize(): Promise<void> {
-    if (this.initialized) return;
+    if (this.services) return;
 
     const { logger } = this.config;
     logger.info('Initializing bwmem...');
 
     // Connect databases
-    this.pg = new PgClient(this.config.postgres, logger);
-    this.redis = new RedisClient(this.config.redis, logger);
+    const pg = new PgClient(this.config.postgres, logger);
+    const redis = new RedisClient(this.config.redis, logger);
 
     // Run migrations
     const dimensions = this.config.embeddings.dimensions;
-    const migrator = new Migrator(this.pg, this.config.tablePrefix, dimensions, logger);
+    const migrator = new Migrator(pg, this.config.tablePrefix, dimensions, logger);
     await migrator.run();
 
     // Initialize optional graph plugin
@@ -74,147 +93,194 @@ export class BwMem {
     // Create services
     const prefix = this.config.tablePrefix;
 
-    this._embedding = new EmbeddingService(this.pg, this.config.embeddings, prefix, logger);
-    this._sentiment = new SentimentService(this.config.llm, logger);
-    this._centroid = new CentroidService(this.redis, logger);
-    this._facts = new FactsService(this.pg, this.config.llm, this.config.graph ?? null, prefix, logger);
-    this._emotionalMoments = new EmotionalMomentsService(this.pg, this.config.llm, prefix, logger);
-    this._contradictions = new ContradictionService(this.pg, prefix, logger);
-    this._behavioral = new BehavioralService(this.pg, prefix, logger);
-    this._summaries = new SummariesService(this.pg, this.config.llm, this._embedding, prefix, logger);
-    this._contextBuilder = new ContextBuilder(
-      this.pg, this._facts, this._embedding, this._emotionalMoments,
-      this._contradictions, this._behavioral,
+    const embedding = new EmbeddingService(pg, this.config.embeddings, prefix, logger);
+    const sentiment = new SentimentService(this.config.llm, logger);
+    const centroid = new CentroidService(redis, logger);
+    const facts = new FactsService(pg, this.config.llm, this.config.graph ?? null, prefix, logger);
+    const emotionalMoments = new EmotionalMomentsService(pg, this.config.llm, prefix, logger);
+    const contradictions = new ContradictionService(pg, prefix, logger);
+    const behavioral = new BehavioralService(pg, prefix, logger);
+    const summaries = new SummariesService(pg, this.config.llm, embedding, prefix, logger);
+    const contextBuilder = new ContextBuilder(
+      pg, facts, embedding, emotionalMoments,
+      contradictions, behavioral,
       this.config.graph ?? null, prefix, logger,
     );
 
-    this._sessionManager = new SessionManager(
-      this.pg, this._embedding, this._sentiment, this._centroid,
-      this._facts, this._emotionalMoments, this._contradictions,
+    const sessionManager = new SessionManager(
+      pg, embedding, sentiment, centroid,
+      facts, emotionalMoments, contradictions,
       this.config.llm,
       prefix, this.config.session.inactivityTimeoutMs, logger,
     );
 
-    // Start consolidation scheduler if enabled
+    let scheduler: ConsolidationScheduler | null = null;
     if (this.config.consolidation.enabled) {
-      this._scheduler = new ConsolidationScheduler(
-        this.pg, this.redis, this.config.llm,
-        this._facts, this._summaries,
+      scheduler = new ConsolidationScheduler(
+        pg, redis, this.config.llm,
+        facts, summaries,
         this.config.graph ?? null, prefix, this.config.consolidation, logger,
       );
-      await this._scheduler.start();
+      await scheduler.start();
     }
 
-    this.initialized = true;
+    // Publish services atomically once every step succeeded. Partial
+    // initialization leaves `this.services` null so subsequent calls fail
+    // cleanly instead of touching half-constructed state.
+    this.services = {
+      pg, redis, facts, embedding, sentiment, centroid,
+      emotionalMoments, contradictions, behavioral, summaries,
+      contextBuilder, sessionManager, scheduler,
+    };
+
     logger.info('bwmem initialized');
   }
 
   // ---- Public API ----
 
-  /** Start a new memory session for a user. */
+  /**
+   * Start a new memory session for a user. The returned `Session` collects
+   * messages, triggers background embedding/sentiment/fact-extraction, and
+   * must be ended via `session.end()` to flush the final summary.
+   *
+   * @param config - User id and optional metadata for the session.
+   * @returns A live `Session` bound to this user.
+   */
   async startSession(config: SessionConfig): Promise<Session> {
-    this.ensureInitialized();
-    return this._sessionManager.startSession(config, this._scheduler ?? null);
+    const s = this.ensureReady();
+    return s.sessionManager.startSession(config, s.scheduler);
   }
 
-  /** Build memory context for LLM prompt injection. */
+  /**
+   * Build a memory context for LLM prompt injection.
+   *
+   * Aggregates facts, similar past messages, similar conversations,
+   * emotional moments, contradictions, behavioral observations, episodic
+   * and semantic patterns, and (optionally) graph context, each guarded by
+   * a per-source timeout so a single slow query cannot stall the whole
+   * response.
+   *
+   * @param userId - Scoped user id.
+   * @param options - Query text, per-source limits, similarity threshold,
+   *   and the per-source timeout in milliseconds.
+   */
   async buildContext(userId: string, options?: BuildContextOptions): Promise<MemoryContext> {
-    this.ensureInitialized();
-    return this._contextBuilder.build(userId, options);
+    const s = this.ensureReady();
+    return s.contextBuilder.build(userId, options);
   }
 
-  /** Facts API - direct access to fact management. */
+  /** Facts API — store, retrieve, search, and remove user facts. */
   get facts(): FactsAPI {
-    this.ensureInitialized();
+    const s = this.ensureReady();
     return {
-      get: (userId: string) => this._facts.getUserFacts(userId),
-      store: (input: StoreFact) => this._facts.storeFact(input),
-      remove: (factId: string, reason?: string) => this._facts.removeFact(factId, reason),
-      search: (userId: string, query: string) => this._facts.searchFacts(userId, query),
+      get: (userId: string) => s.facts.getUserFacts(userId),
+      store: (input: StoreFact) => s.facts.storeFact(input),
+      remove: (factId: string, reason?: string) => s.facts.removeFact(factId, reason),
+      search: (userId: string, query: string) => s.facts.searchFacts(userId, query),
     };
   }
 
-  /** Semantic search across messages. */
+  /**
+   * Semantic search across this user's messages using pgvector cosine
+   * similarity. Returns the most similar messages ordered by score.
+   */
   async searchMessages(userId: string, query: string, limit?: number, threshold?: number) {
-    this.ensureInitialized();
-    return this._embedding.searchSimilarMessages(userId, query, limit, threshold);
+    const s = this.ensureReady();
+    return s.embedding.searchSimilarMessages(userId, query, limit, threshold);
   }
 
-  /** Semantic search across conversation summaries. */
+  /** Semantic search across this user's conversation summaries. */
   async searchConversations(userId: string, query: string, limit?: number, threshold?: number) {
-    this.ensureInitialized();
-    return this._embedding.searchSimilarConversations(userId, query, limit, threshold);
+    const s = this.ensureReady();
+    return s.embedding.searchSimilarConversations(userId, query, limit, threshold);
   }
 
-  /** Emotional moments API - retrieve captured emotional moments. */
+  /** Emotional moments API — retrieve recent captured high-salience moments. */
   get emotions(): EmotionsAPI {
-    this.ensureInitialized();
+    const s = this.ensureReady();
     return {
       getRecent: (userId: string, days?: number, limit?: number) =>
-        this._emotionalMoments.getRecent(userId, days, limit),
+        s.emotionalMoments.getRecent(userId, days, limit),
     };
   }
 
-  /** Contradictions API - retrieve detected contradictions. */
+  /** Contradictions API — retrieve unsurfaced contradiction signals. */
   get contradictions(): ContradictionsAPI {
-    this.ensureInitialized();
+    const s = this.ensureReady();
     return {
       getUnsurfaced: (userId: string, sessionId?: string, limit?: number) =>
-        this._contradictions.getUnsurfaced(userId, sessionId, limit),
+        s.contradictions.getUnsurfaced(userId, sessionId, limit),
     };
   }
 
-  /** Behavioral observations API. */
+  /** Behavioral observations API — active patterns inferred from sentiment. */
   get behavioral(): BehavioralAPI {
-    this.ensureInitialized();
+    const s = this.ensureReady();
     return {
       getActive: (userId: string, limit?: number) =>
-        this._behavioral.getActive(userId, limit),
+        s.behavioral.getActive(userId, limit),
     };
   }
 
   /** Conversation summaries API. */
   get summaries(): SummariesAPI {
-    this.ensureInitialized();
+    const s = this.ensureReady();
     return {
       getForSession: (sessionId: string) =>
-        this._summaries.getForSession(sessionId),
+        s.summaries.getForSession(sessionId),
     };
   }
 
-  /** Trigger consolidation on demand. Type: 'daily' | 'weekly'. Requires consolidation enabled. */
+  /**
+   * Trigger a consolidation run on demand. Normally the scheduler runs
+   * daily/weekly jobs via cron; this is useful for tests and one-off
+   * replays.
+   *
+   * @throws Error if consolidation is disabled in config.
+   */
   async triggerConsolidation(type: 'daily' | 'weekly'): Promise<void> {
-    this.ensureInitialized();
-    if (!this._scheduler) throw new Error('Consolidation is not enabled');
-    await this._scheduler.addJob(type);
+    const s = this.ensureReady();
+    if (!s.scheduler) throw new Error('Consolidation is not enabled');
+    await s.scheduler.addJob(type);
   }
 
   /** Shutdown all connections and schedulers. */
   async shutdown(): Promise<void> {
     const { logger } = this.config;
+    const s = this.services;
+    if (!s) {
+      logger.info('bwmem shutdown: never initialized');
+      return;
+    }
     logger.info('Shutting down bwmem...');
 
-    this._sessionManager?.shutdown();
+    s.sessionManager.shutdown();
 
-    if (this._scheduler) {
-      await this._scheduler.stop();
+    if (s.scheduler) {
+      await s.scheduler.stop();
     }
 
     if (this.config.graph) {
       await this.config.graph.shutdown();
     }
 
-    await this.redis?.close();
-    await this.pg?.close();
+    await s.redis.close();
+    await s.pg.close();
 
-    this.initialized = false;
+    this.services = null;
     logger.info('bwmem shut down');
   }
 
-  private ensureInitialized(): void {
-    if (!this.initialized) {
+  /**
+   * Return the initialized service bag or throw. Internal use only — the
+   * public API always reaches services through this method so "not yet
+   * initialized" produces a clean error.
+   */
+  private ensureReady(): Services {
+    if (!this.services) {
       throw new Error('bwmem: call initialize() before using the SDK');
     }
+    return this.services;
   }
 }
 

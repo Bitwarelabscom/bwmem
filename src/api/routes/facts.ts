@@ -62,7 +62,13 @@ export async function factRoutes(
   });
 
   // GET /facts/:userId/search
-  app.get('/facts/:userId/search', async (request: FastifyRequest, _reply) => {
+  // Per-route rate limit: fact search runs an ILIKE query across the facts
+  // table, cheaper than vector search but still worth capping per tenant.
+  app.get('/facts/:userId/search', {
+    config: {
+      rateLimit: { max: 60, timeWindow: '1 minute' },
+    },
+  }, async (request: FastifyRequest, _reply) => {
     const tenant = request.tenant!;
     const { userId } = factsParamsSchema.parse(request.params);
     const { query } = searchFactsQuerySchema.parse(request.query);

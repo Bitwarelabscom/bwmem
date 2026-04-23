@@ -3,11 +3,38 @@
 
 import { z } from 'zod';
 
+// ---- Bounded free-form metadata ----
+//
+// Fastify caps the request body at 1 MB, but an open `z.record(z.unknown())`
+// still permits deeply-nested objects that force JSON.stringify / audit
+// serialization to do pathological work. Require each metadata object to
+// be a flat-ish dictionary with a bounded number of keys and bounded
+// serialized size.
+const MAX_METADATA_KEYS = 32;
+const MAX_METADATA_SERIALIZED_BYTES = 8 * 1024;
+
+export const boundedMetadataSchema = z
+  .record(z.unknown())
+  .refine(
+    (obj) => Object.keys(obj).length <= MAX_METADATA_KEYS,
+    { message: `metadata must have at most ${MAX_METADATA_KEYS} keys` },
+  )
+  .refine(
+    (obj) => {
+      try {
+        return JSON.stringify(obj).length <= MAX_METADATA_SERIALIZED_BYTES;
+      } catch {
+        return false;
+      }
+    },
+    { message: `metadata must serialize to ${MAX_METADATA_SERIALIZED_BYTES} bytes or fewer` },
+  );
+
 // ---- Sessions ----
 
 export const createSessionSchema = z.object({
   userId: z.string().min(1).max(255),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: boundedMetadataSchema.optional(),
 });
 
 export const endSessionParamsSchema = z.object({
@@ -124,7 +151,7 @@ export const graphParamsSchema = z.object({
 export const registerSchema = z.object({
   name: z.string().min(1).max(255),
   email: z.string().email().max(255),
-  tier: z.enum(['tester', 'hobby']).default('tester'),
+  tier: z.literal('tester').default('tester'),
 });
 
 export const magicLinkRequestSchema = z.object({
@@ -160,6 +187,8 @@ export const createTenantSchema = z.object({
   name: z.string().min(1).max(255),
   email: z.string().email().max(255),
   tier: z.enum(['tester', 'hobby', 'builder', 'enterprise']).default('tester'),
+  // Emergency provisioning only — skips email verification. Audit-logged.
+  skipVerification: z.boolean().optional(),
 });
 
 export const updateTenantSchema = z.object({
@@ -174,3 +203,38 @@ export const updateTenantSchema = z.object({
 export const tenantIdParamsSchema = z.object({
   id: z.string().uuid(),
 });
+
+// ---- Inferred request/response types ----
+//
+// Expose `z.infer<>` for each schema so route handlers and API clients
+// derive their types from the same source as validation — no drift between
+// schema and type.
+
+export type CreateSessionRequest = z.infer<typeof createSessionSchema>;
+export type EndSessionParams = z.infer<typeof endSessionParamsSchema>;
+export type SessionMessagesParams = z.infer<typeof sessionMessagesParamsSchema>;
+export type RecordMessageRequest = z.infer<typeof recordMessageSchema>;
+export type ContextQuery = z.infer<typeof contextQuerySchema>;
+export type SearchQuery = z.infer<typeof searchQuerySchema>;
+export type FactsParams = z.infer<typeof factsParamsSchema>;
+export type StoreFactRequest = z.infer<typeof storeFactSchema>;
+export type DeleteFactParams = z.infer<typeof deleteFactParamsSchema>;
+export type DeleteFactBody = z.infer<typeof deleteFactBodySchema>;
+export type SearchFactsQuery = z.infer<typeof searchFactsQuerySchema>;
+export type EmotionsParams = z.infer<typeof emotionsParamsSchema>;
+export type EmotionsQuery = z.infer<typeof emotionsQuerySchema>;
+export type ContradictionsParams = z.infer<typeof contradictionsParamsSchema>;
+export type ContradictionsQuery = z.infer<typeof contradictionsQuerySchema>;
+export type ConsolidateRequest = z.infer<typeof consolidateSchema>;
+export type SummaryParams = z.infer<typeof summaryParamsSchema>;
+export type GraphParams = z.infer<typeof graphParamsSchema>;
+export type RegisterRequest = z.infer<typeof registerSchema>;
+export type MagicLinkRequest = z.infer<typeof magicLinkRequestSchema>;
+export type VerifyTokenRequest = z.infer<typeof verifyTokenSchema>;
+export type AddIpAllowlistRequest = z.infer<typeof addIpAllowlistSchema>;
+export type RemoveIpAllowlistParams = z.infer<typeof removeIpAllowlistParamsSchema>;
+export type AuditLogQuery = z.infer<typeof auditLogQuerySchema>;
+export type CreateTenantRequest = z.infer<typeof createTenantSchema>;
+export type UpdateTenantRequest = z.infer<typeof updateTenantSchema>;
+export type TenantIdParams = z.infer<typeof tenantIdParamsSchema>;
+export type BoundedMetadata = z.infer<typeof boundedMetadataSchema>;

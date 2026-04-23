@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import { globalStats } from '../stats.js';
 import type { PgClient } from '../db/postgres.js';
 import type { EmbeddingService } from '../memory/embedding.service.js';
 import type { SentimentService } from '../memory/sentiment.service.js';
@@ -28,6 +29,21 @@ export class Session {
   private messageBuffer: Array<{ role: string; content: string }> = [];
   private ended = false;
   private _pending: Set<Promise<void>> = new Set();
+  private _onEnd: (() => void) | null = null;
+
+  /** True once `end()` has been called. */
+  get isEnded(): boolean {
+    return this.ended;
+  }
+
+  /**
+   * Register a callback fired once when this session ends. Used by the API
+   * layer to evict the in-memory managed-session entry immediately, rather
+   * than waiting for the periodic inactivity sweep.
+   */
+  onEnd(callback: () => void): void {
+    this._onEnd = callback;
+  }
 
   constructor(
     id: string, userId: string, metadata: Record<string, unknown>,
@@ -70,9 +86,10 @@ export class Session {
     this.messageBuffer.push({ role, content });
 
     // Background: embedding + sentiment + fact extraction + emotional moments
-    const task = this.processMessageBackground(messageId, role, content).catch(err =>
-      this.logger.error('Background message processing failed', { error: (err as Error).message })
-    );
+    const task = this.processMessageBackground(messageId, role, content).catch(err => {
+      globalStats.increment('background_message_processing_errors');
+      this.logger.error('Background message processing failed', { error: (err as Error).message });
+    });
     this._pending.add(task);
     task.then(() => this._pending.delete(task), () => this._pending.delete(task));
 
@@ -113,6 +130,13 @@ export class Session {
     }
 
     this.logger.info('Session ended', { sessionId: this.id, messages: this.messageBuffer.length });
+
+    // Notify any observer (e.g., API layer in-memory map) that this session
+    // is done so they can evict without waiting for the periodic sweep.
+    if (this._onEnd) {
+      try { this._onEnd(); } catch { /* observer errors must not bubble */ }
+      this._onEnd = null;
+    }
   }
 
   /** Get all messages in this session. */
@@ -294,6 +318,7 @@ Return [] if no contradictions. When in doubt, return [].` },
         });
       }
     } catch (error) {
+      globalStats.increment('behavioral_contradiction_errors');
       this.logger.error('Behavioral contradiction detection failed', {
         error: (error as Error).message,
       });

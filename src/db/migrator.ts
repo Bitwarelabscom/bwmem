@@ -70,7 +70,17 @@ export class Migrator {
       sql = sql.replace(/\$\{prefix\}/g, this.prefix);
       sql = sql.replace(/\$\{dimensions\}/g, String(this.dimensions));
 
-      await this.pg.query(sql);
+      // Statements containing CONCURRENTLY cannot run inside a transaction
+      // block. pg's simple-query protocol wraps multi-statement SQL in an
+      // implicit transaction, so split and execute statements individually.
+      if (/\bCONCURRENTLY\b/i.test(sql)) {
+        for (const stmt of splitStatements(sql)) {
+          await this.pg.query(stmt);
+        }
+      } else {
+        await this.pg.query(sql);
+      }
+
       await this.pg.query(
         `INSERT INTO ${this.prefix}migrations (name) VALUES ($1)`,
         [file]
@@ -79,4 +89,45 @@ export class Migrator {
       this.logger.info(`Migration applied: ${file}`);
     }
   }
+}
+
+/**
+ * Split a SQL script into statements on top-level `;` boundaries.
+ * Ignores semicolons inside single-quoted strings and `--` line comments.
+ * Sufficient for DDL migrations in this project (no PL/pgSQL bodies).
+ */
+function splitStatements(sql: string): string[] {
+  const out: string[] = [];
+  let buf = '';
+  let inSingle = false;
+  let inLineComment = false;
+  for (let i = 0; i < sql.length; i++) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+    if (inLineComment) {
+      buf += ch;
+      if (ch === '\n') inLineComment = false;
+      continue;
+    }
+    if (!inSingle && ch === '-' && next === '-') {
+      inLineComment = true;
+      buf += ch;
+      continue;
+    }
+    if (ch === "'" && sql[i - 1] !== '\\') {
+      inSingle = !inSingle;
+      buf += ch;
+      continue;
+    }
+    if (ch === ';' && !inSingle) {
+      const trimmed = buf.trim();
+      if (trimmed) out.push(trimmed);
+      buf = '';
+      continue;
+    }
+    buf += ch;
+  }
+  const tail = buf.trim();
+  if (tail) out.push(tail);
+  return out;
 }

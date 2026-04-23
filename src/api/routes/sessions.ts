@@ -51,12 +51,18 @@ export async function sessionRoutes(
 
     const session = await bwmem.startSession({ userId: scopedId, metadata: body.metadata });
 
+    const now = new Date();
     activeSessions.set(session.id, {
       session,
       tenantId: tenant.id,
       userId: body.userId,
-      createdAt: new Date(),
+      createdAt: now,
+      lastActivityAt: now,
     });
+
+    // Evict from the managed-sessions map as soon as the session ends,
+    // without waiting for the inactivity sweep.
+    session.onEnd(() => activeSessions.delete(session.id));
 
     return {
       success: true,
@@ -96,6 +102,7 @@ export async function sessionRoutes(
     const managed = activeSessions.get(sessionId);
     if (managed) {
       if (managed.tenantId !== tenant.id) throw new ForbiddenError();
+      managed.lastActivityAt = new Date();
       const messages = await managed.session.getMessages();
       return { success: true, data: { messages: stripTenantFromResponse(messages) } };
     }

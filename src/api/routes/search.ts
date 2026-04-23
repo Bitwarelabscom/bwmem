@@ -13,7 +13,15 @@ export async function searchRoutes(
   const { bwmem } = opts;
 
   // GET /search — semantic search across messages or conversations
-  app.get('/search', async (request: FastifyRequest, _reply) => {
+  //
+  // Expensive endpoint: every call issues an embedding request followed by a
+  // pgvector similarity scan. A per-route rate limit keeps LLM costs and
+  // DB load predictable even under a compromised key.
+  app.get('/search', {
+    config: {
+      rateLimit: { max: 30, timeWindow: '1 minute' },
+    },
+  }, async (request: FastifyRequest, _reply) => {
     const tenant = request.tenant!;
     const query = searchQuerySchema.parse(request.query);
 

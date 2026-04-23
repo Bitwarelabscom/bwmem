@@ -9,12 +9,21 @@ import { createTenantSchema, updateTenantSchema, tenantIdParamsSchema, auditLogQ
 import { generateApiKey } from '../utils/api-keys.js';
 import { ForbiddenError } from '../utils/errors.js';
 import type { AuditService } from '../services/audit.js';
+import type { MagicLinkService } from '../services/magic-link.js';
+import type { EmailService } from '../services/email.js';
 
 export async function adminRoutes(
   app: FastifyInstance,
-  opts: { pg: PgClient; tablePrefix: string; invalidateTenant?: (tenantId: string) => void; audit?: AuditService },
+  opts: {
+    pg: PgClient;
+    tablePrefix: string;
+    invalidateTenant?: (tenantId: string) => void;
+    audit?: AuditService;
+    magicLink?: MagicLinkService;
+    email?: EmailService;
+  },
 ): Promise<void> {
-  const { pg, tablePrefix, invalidateTenant, audit } = opts;
+  const { pg, tablePrefix, invalidateTenant, audit, magicLink, email } = opts;
 
   // Admin-only guard
   app.addHook('preHandler', async (request) => {
@@ -23,30 +32,79 @@ export async function adminRoutes(
     }
   });
 
+  // Audit every failed admin operation so probing for tenant IDs or
+  // permissions surfaces in the audit log.
+  app.addHook('onError', async (request, reply, error) => {
+    if (!audit) return;
+    try {
+      audit.log({
+        tenantId: null,
+        eventType: 'admin_op_failed',
+        ip: request.ip,
+        userAgent: request.headers['user-agent'] ?? null,
+        details: {
+          method: request.method,
+          url: request.url,
+          statusCode: reply.statusCode,
+          error: error.message,
+        },
+      });
+    } catch { /* audit must not mask the original error */ }
+  });
+
   // POST /admin/tenants — create a new tenant
+  //
+  // Tenant is created with email_verified=FALSE and a verification email is
+  // sent. The API key is returned once (for the admin to deliver) but it
+  // will be rejected by the auth hook until the tenant verifies their
+  // email, preventing a typo or compromised admin from silently granting
+  // access to an attacker-controlled email.
+  //
+  // `skipVerification: true` bypasses this for emergency provisioning; it
+  // is always audit-logged.
   app.post('/tenants', async (request: FastifyRequest, _reply) => {
     const body = createTenantSchema.parse(request.body);
     const tier = body.tier as TenantTier;
     const defaults = TIER_DEFAULTS[tier];
     const { key, hash, prefix } = generateApiKey();
 
+    const skipVerification = body.skipVerification === true;
+    const verifiedClause = skipVerification ? 'TRUE' : 'FALSE';
+    const verifiedAtClause = skipVerification ? 'NOW()' : 'NULL';
+
     const rows = await pg.query<{ id: string }>(
       `INSERT INTO ${tablePrefix}api_tenants
         (name, email, api_key_hash, api_key_prefix, tier, max_users,
          max_embeddings_per_month, rate_limit_per_minute,
          email_verified, email_verified_at, registration_source)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, NOW(), 'admin')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, ${verifiedClause}, ${verifiedAtClause}, 'admin')
        RETURNING id`,
       [body.name, body.email, hash, prefix, tier, defaults.maxUsers, defaults.maxEmbeddingsPerMonth, defaults.rateLimitPerMinute],
     );
 
-    if (audit && rows.length > 0) {
+    const tenantId = rows[0]?.id;
+
+    // Kick off the verification email asynchronously so the admin response
+    // isn't blocked on SMTP. Errors are logged; the admin can manually
+    // resend if needed.
+    if (tenantId && !skipVerification && magicLink && email) {
+      void (async () => {
+        try {
+          const token = await magicLink.createToken(tenantId, 'verify_email', request.ip);
+          await email.sendVerificationEmail(body.email, token, body.name);
+        } catch (err) {
+          app.log.error(err, 'Failed to send admin-triggered verification email');
+        }
+      })();
+    }
+
+    if (audit && tenantId) {
       audit.log({
-        tenantId: rows[0].id,
+        tenantId,
         eventType: 'admin_create_tenant',
         ip: request.ip,
         userAgent: request.headers['user-agent'] ?? null,
-        details: { tier, name: body.name, email: body.email },
+        details: { tier, name: body.name, email: body.email, skipVerification },
       });
     }
 
@@ -58,6 +116,8 @@ export async function adminRoutes(
         tier,
         apiKey: key, // Shown only once
         apiKeyPrefix: prefix,
+        emailVerified: skipVerification,
+        verificationEmailSent: !skipVerification,
       },
     };
   });

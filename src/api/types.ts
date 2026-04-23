@@ -42,6 +42,7 @@ export interface ManagedSession {
   tenantId: string;
   userId: string; // original (unscoped) userId
   createdAt: Date;
+  lastActivityAt: Date;
 }
 
 // ---- Request decoration ----

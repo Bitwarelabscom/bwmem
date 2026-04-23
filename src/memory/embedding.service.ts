@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { PgClient } from '../db/postgres.js';
 import type { EmbeddingProvider, Logger, SimilarMessage, SimilarConversation } from '../types.js';
 
@@ -9,6 +10,36 @@ interface CacheEntry {
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const CACHE_MAX_SIZE = 100;
 const MAX_INPUT_CHARS = 30000;
+
+/**
+ * Cache key = SHA-256 over the truncated input the provider will see.
+ * A slice-based key collides for any two texts sharing a prefix, which
+ * would return the wrong embedding from cache. Hash is collision-safe.
+ */
+function makeCacheKey(text: string): string {
+  const truncated = text.length > MAX_INPUT_CHARS ? text.slice(0, MAX_INPUT_CHARS) : text;
+  return createHash('sha256').update(truncated).digest('hex');
+}
+
+// ---- DB row types ----
+
+interface SimilarMessageRow {
+  id: string;
+  session_id: string;
+  content: string;
+  role: string;
+  /** pgvector returns similarity as a string via node-pg for REAL columns. */
+  similarity: string;
+  created_at: Date;
+}
+
+interface SimilarConversationRow {
+  session_id: string;
+  summary: string;
+  topics: string[] | null;
+  similarity: string;
+  created_at: Date;
+}
 
 export class EmbeddingService {
   private pg: PgClient;
@@ -27,7 +58,7 @@ export class EmbeddingService {
 
   /** Generate embedding for text with caching and request coalescing. */
   async generate(text: string): Promise<number[]> {
-    const cacheKey = text.slice(0, 1000);
+    const cacheKey = makeCacheKey(text);
     const now = Date.now();
 
     // Check cache
@@ -58,16 +89,18 @@ export class EmbeddingService {
     const results: number[][] = new Array(texts.length);
     const uncachedIndices: number[] = [];
     const uncachedTexts: string[] = [];
+    const uncachedKeys: string[] = [];
     const now = Date.now();
 
     for (let i = 0; i < texts.length; i++) {
-      const cacheKey = texts[i].slice(0, 1000);
+      const cacheKey = makeCacheKey(texts[i]);
       const cached = this.cache.get(cacheKey);
       if (cached && (now - cached.timestamp) < CACHE_TTL_MS) {
         results[i] = cached.embedding;
       } else {
         uncachedIndices.push(i);
         uncachedTexts.push(texts[i].slice(0, MAX_INPUT_CHARS));
+        uncachedKeys.push(cacheKey);
       }
     }
 
@@ -78,9 +111,7 @@ export class EmbeddingService {
     for (let j = 0; j < batchResults.length; j++) {
       const originalIndex = uncachedIndices[j];
       results[originalIndex] = batchResults[j];
-
-      const cacheKey = texts[originalIndex].slice(0, 1000);
-      this.cache.set(cacheKey, { embedding: batchResults[j], timestamp: Date.now() });
+      this.cache.set(uncachedKeys[j], { embedding: batchResults[j], timestamp: Date.now() });
     }
 
     this.cleanCache();
@@ -142,14 +173,14 @@ export class EmbeddingService {
       sql += ` ORDER BY embedding <=> $1::vector LIMIT $${params.length + 1}`;
       params.push(limit);
 
-      const rows = await this.pg.query<Record<string, unknown>>(sql, params);
+      const rows = await this.pg.query<SimilarMessageRow>(sql, params);
       return rows.map(row => ({
-        messageId: row.id as string,
-        sessionId: row.session_id as string,
-        content: row.content as string,
-        role: row.role as string,
-        similarity: parseFloat(row.similarity as string),
-        createdAt: row.created_at as Date,
+        messageId: row.id,
+        sessionId: row.session_id,
+        content: row.content,
+        role: row.role,
+        similarity: parseFloat(row.similarity),
+        createdAt: row.created_at,
       }));
     } catch (error) {
       this.logger.error('searchSimilarMessages failed', { error: (error as Error).message });
@@ -165,7 +196,7 @@ export class EmbeddingService {
       const embedding = await this.generate(query);
       const vectorString = `[${embedding.join(',')}]`;
 
-      const rows = await this.pg.query<Record<string, unknown>>(
+      const rows = await this.pg.query<SimilarConversationRow>(
         `SELECT session_id, summary, topics,
                 1 - (embedding <=> $1::vector) as similarity,
                 created_at
@@ -179,11 +210,11 @@ export class EmbeddingService {
       );
 
       return rows.map(row => ({
-        sessionId: row.session_id as string,
-        summary: row.summary as string,
-        topics: (row.topics as string[]) ?? [],
-        similarity: parseFloat(row.similarity as string),
-        createdAt: row.created_at as Date,
+        sessionId: row.session_id,
+        summary: row.summary,
+        topics: row.topics ?? [],
+        similarity: parseFloat(row.similarity),
+        createdAt: row.created_at,
       }));
     } catch (error) {
       this.logger.error('searchSimilarConversations failed', { error: (error as Error).message });

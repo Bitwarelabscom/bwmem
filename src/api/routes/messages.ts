@@ -14,7 +14,14 @@ export async function messageRoutes(
   const { activeSessions } = opts;
 
   // POST /messages — record a message in a session
-  app.post('/messages', async (request: FastifyRequest, _reply) => {
+  // Each message triggers background embedding + sentiment + (every 3 msgs)
+  // fact extraction + contradiction detection. Tighter per-route limit
+  // keeps LLM cost predictable per tenant.
+  app.post('/messages', {
+    config: {
+      rateLimit: { max: 60, timeWindow: '1 minute' },
+    },
+  }, async (request: FastifyRequest, _reply) => {
     const tenant = request.tenant!;
     const body = recordMessageSchema.parse(request.body);
 
@@ -25,6 +32,7 @@ export async function messageRoutes(
     if (managed.tenantId !== tenant.id) {
       throw new ForbiddenError();
     }
+    managed.lastActivityAt = new Date();
 
     const message = await managed.session.recordMessage({
       role: body.role,

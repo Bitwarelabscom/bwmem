@@ -1,6 +1,7 @@
 import type { PgClient } from '../db/postgres.js';
 import type { LLMProvider, Logger, Fact, StoreFact, ExtractedFact, GraphPlugin } from '../types.js';
 import { formatRelativeTime } from '../utils/time-utils.js';
+import { globalStats } from '../stats.js';
 
 /** Normalize a fact key for dedup comparison: lowercase, strip underscores/hyphens, trim common prefixes. */
 function normalizeKey(key: string): string {
@@ -194,9 +195,10 @@ export class FactsService {
       const fact = mapRowToFact(result.rows[0]);
 
       if (this.graph) {
-        this.graph.syncFact(userId, fact).catch(e =>
-          this.logger.warn('Graph sync failed', { error: (e as Error).message })
-        );
+        this.graph.syncFact(userId, fact).catch(e => {
+          globalStats.increment('graph_sync_errors');
+          this.logger.warn('Graph sync failed', { error: (e as Error).message });
+        });
       }
 
       return fact;
@@ -331,6 +333,7 @@ Return [] if no facts found.`;
         return true;
       });
     } catch (error) {
+      globalStats.increment('fact_extraction_errors');
       this.logger.error('Fact extraction failed', {
         error: (error as Error).message,
         stack: (error as Error).stack?.split('\n').slice(0, 3).join(' | '),
@@ -348,45 +351,60 @@ Return [] if no facts found.`;
 
   /** Store facts extracted by LLM, with cross-key semantic dedup. */
   async storeExtractedFacts(userId: string, facts: ExtractedFact[], sessionId?: string): Promise<Fact[]> {
-    let existingFacts: Fact[] = [];
-    try {
-      existingFacts = await this.getUserFacts(userId, undefined, 50);
-    } catch { /* non-blocking */ }
+    // Pre-fetch: all active facts for this user + any active facts whose
+    // (category, fact_key) exactly matches one of the extracted pairs.
+    // The second arm catches exact-match dedup targets even if the user
+    // has a very large fact set where the top-ranked page would miss them.
+    const existingFacts: Fact[] = await this.loadDedupCandidates(userId, facts);
+
+    // Index by normalized key for O(1) fast-path lookup during semantic dedup.
+    const byNormKey = new Map<string, Fact[]>();
+    for (const ef of existingFacts) {
+      const k = normalizeKey(ef.factKey);
+      const arr = byNormKey.get(k);
+      if (arr) arr.push(ef); else byNormKey.set(k, [ef]);
+    }
 
     const stored: Fact[] = [];
-    for (const f of facts) {
-      try {
-        // For multi-valued keys, disambiguate by appending a value slug to the key
-        // e.g., job_title → job_title:ceramics_artist vs job_title:library_worker
-        const keyNorm = f.factKey.toLowerCase().replace(/[_\-\s]+/g, '_');
-        if (FactsService.MULTI_VALUED_KEYS.has(keyNorm)) {
-          const slug = f.factValue.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 30);
-          f.factKey = `${f.factKey}:${slug}`;
-        }
+    const bumpIds: string[] = [];
+    const toInsert: Array<{ input: StoreFact; original: ExtractedFact }> = [];
 
-        // Cross-key semantic dedup: check if an existing fact covers the same info
-        const normKey = normalizeKey(f.factKey);
-        const duplicate = existingFacts.find(existing => {
+    for (const f of facts) {
+      // For multi-valued keys, disambiguate by appending a value slug to the key
+      // e.g., job_title → job_title:ceramics_artist vs job_title:library_worker
+      const keyNorm = f.factKey.toLowerCase().replace(/[_\-\s]+/g, '_');
+      if (FactsService.MULTI_VALUED_KEYS.has(keyNorm)) {
+        const slug = f.factValue.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 30);
+        f.factKey = `${f.factKey}:${slug}`;
+      }
+
+      // Cross-key semantic dedup: fast path by exact normalized-key hit, slow
+      // path by similar-key scan.
+      const normKey = normalizeKey(f.factKey);
+      let duplicate: Fact | undefined;
+      const exactHits = byNormKey.get(normKey);
+      if (exactHits) {
+        duplicate = exactHits.find(existing => valuesAreSimilar(existing.factValue, f.factValue));
+      }
+      if (!duplicate) {
+        duplicate = existingFacts.find(existing => {
           const existNormKey = normalizeKey(existing.factKey);
-          // Same normalized key with similar value, or same value with similar key
-          return (existNormKey === normKey || valuesAreSimilar(existNormKey, normKey))
+          return existNormKey !== normKey
+            && valuesAreSimilar(existNormKey, normKey)
             && valuesAreSimilar(existing.factValue, f.factValue);
         });
+      }
 
-        if (duplicate) {
-          // Bump mention count on existing rather than creating a new fact
-          this.logger.debug('Dedup: skipping similar fact', {
-            newKey: f.factKey, existingKey: duplicate.factKey, value: f.factValue,
-          });
-          await this.pg.query(
-            `UPDATE ${this.prefix}facts SET mention_count = mention_count + 1, last_mentioned = NOW()
-             WHERE id = $1`,
-            [duplicate.id],
-          );
-          continue;
-        }
+      if (duplicate) {
+        this.logger.debug('Dedup: skipping similar fact', {
+          newKey: f.factKey, existingKey: duplicate.factKey, value: f.factValue,
+        });
+        bumpIds.push(duplicate.id);
+        continue;
+      }
 
-        const fact = await this.storeFact({
+      toInsert.push({
+        input: {
           userId,
           category: f.category,
           key: f.factKey,
@@ -394,15 +412,97 @@ Return [] if no facts found.`;
           confidence: f.confidence,
           factType: f.factType || 'permanent',
           sessionId,
-        });
-        stored.push(fact);
-        // Add to existing list so subsequent facts in this batch also dedup
-        existingFacts.push(fact);
+        },
+        original: f,
+      });
+    }
+
+    // Batched bump of mention counts for all dedup hits in one round-trip.
+    if (bumpIds.length > 0) {
+      try {
+        await this.pg.query(
+          `UPDATE ${this.prefix}facts
+           SET mention_count = mention_count + 1, last_mentioned = NOW()
+           WHERE id = ANY($1::uuid[])`,
+          [bumpIds],
+        );
       } catch (error) {
-        this.logger.error('Failed to store extracted fact', { error: (error as Error).message, factKey: f.factKey });
+        this.logger.warn('Batched mention-count bump failed', { error: (error as Error).message });
+      }
+    }
+
+    // Store each new fact. Kept as individual transactions (not one outer
+    // transaction) because storeFact contains supersession logic that may
+    // legitimately fail per-fact (e.g., partial input), and per-fact
+    // isolation preserves the existing "log and continue" behavior.
+    for (const { input, original } of toInsert) {
+      try {
+        const fact = await this.storeFact(input);
+        stored.push(fact);
+        existingFacts.push(fact);
+        const nk = normalizeKey(fact.factKey);
+        const arr = byNormKey.get(nk);
+        if (arr) arr.push(fact); else byNormKey.set(nk, [fact]);
+      } catch (error) {
+        this.logger.error('Failed to store extracted fact', {
+          error: (error as Error).message, factKey: original.factKey,
+        });
       }
     }
     return stored;
+  }
+
+  /**
+   * Build the dedup candidate set: top-ranked active facts for the user,
+   * unioned with any active facts whose exact (category, fact_key) matches
+   * one of the extracted pairs. The exact-match arm uses the
+   * idx_<prefix>facts_user_key index so it is cheap even for users with
+   * thousands of facts.
+   */
+  private async loadDedupCandidates(userId: string, extracted: ExtractedFact[]): Promise<Fact[]> {
+    const top: Fact[] = await this.getUserFacts(userId, undefined, 100).catch(() => []);
+
+    // Dedup extracted pairs for the IN clause.
+    const pairKey = (c: string, k: string) => `${c} ${k}`;
+    const pairs = new Map<string, { category: string; factKey: string }>();
+    for (const f of extracted) {
+      if (!f.category || !f.factKey) continue;
+      pairs.set(pairKey(f.category, f.factKey), { category: f.category, factKey: f.factKey });
+    }
+    if (pairs.size === 0) return top;
+
+    // Build (cat, key) IN (...) query
+    const params: unknown[] = [userId];
+    const tuples: string[] = [];
+    for (const p of pairs.values()) {
+      const ci = params.push(p.category);
+      const ki = params.push(p.factKey);
+      tuples.push(`($${ci}, $${ki})`);
+    }
+    let exactMatches: Fact[] = [];
+    try {
+      const rows = await this.pg.query<Record<string, unknown>>(
+        `SELECT * FROM ${this.prefix}facts
+         WHERE user_id = $1
+           AND fact_status = 'active'
+           AND (category, fact_key) IN (${tuples.join(', ')})`,
+        params,
+      );
+      exactMatches = rows.map(mapRowToFact);
+    } catch (error) {
+      this.logger.warn('Dedup exact-match lookup failed', { error: (error as Error).message });
+      return top;
+    }
+
+    // Merge: prefer exact matches, then top page, dedup by id.
+    const seen = new Set<string>();
+    const merged: Fact[] = [];
+    for (const f of [...exactMatches, ...top]) {
+      if (seen.has(f.id)) continue;
+      seen.add(f.id);
+      merged.push(f);
+    }
+    return merged;
   }
 
   /** Format facts for inclusion in an LLM prompt. */

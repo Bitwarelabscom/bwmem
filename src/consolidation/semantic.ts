@@ -1,6 +1,9 @@
 import type { PgClient } from '../db/postgres.js';
 import type { LLMProvider, Logger, GraphPlugin } from '../types.js';
 import type { FactsService } from '../memory/facts.service.js';
+import { mapLimit } from '../utils/concurrent.js';
+
+const CONSOLIDATION_CONCURRENCY = 5;
 
 /**
  * Semantic consolidation - aggregates episodic patterns into long-term knowledge.
@@ -37,12 +40,17 @@ export class SemanticConsolidator {
          WHERE created_at > NOW() - INTERVAL '24 hours'`
       );
 
-      let totalPatterns = 0;
-
-      for (const { user_id: userId } of users) {
-        const count = await this.consolidateUserDaily(userId);
-        totalPatterns += count;
-      }
+      const counts = await mapLimit(users, CONSOLIDATION_CONCURRENCY, async ({ user_id: userId }) => {
+        try {
+          return await this.consolidateUserDaily(userId);
+        } catch (err) {
+          this.logger.warn('Per-user daily consolidation failed', {
+            userId, error: (err as Error).message,
+          });
+          return 0;
+        }
+      });
+      const totalPatterns = counts.reduce((a, b) => a + b, 0);
 
       await this.pg.query(
         `UPDATE ${this.prefix}consolidation_runs
@@ -75,9 +83,15 @@ export class SemanticConsolidator {
         `SELECT DISTINCT user_id FROM ${this.prefix}semantic_knowledge`
       );
 
-      for (const { user_id: userId } of users) {
-        await this.consolidateUserWeekly(userId);
-      }
+      await mapLimit(users, CONSOLIDATION_CONCURRENCY, async ({ user_id: userId }) => {
+        try {
+          await this.consolidateUserWeekly(userId);
+        } catch (err) {
+          this.logger.warn('Per-user weekly consolidation failed', {
+            userId, error: (err as Error).message,
+          });
+        }
+      });
 
       await this.pg.query(
         `UPDATE ${this.prefix}consolidation_runs

@@ -1,5 +1,6 @@
 // Main entry point for @bitwarelabs/bwmem
 export { BwMem } from './bwmem.js';
+export { BwMemStats } from './stats.js';
 
 // Types
 export type {
@@ -19,6 +20,7 @@ export type {
 
   // Graph plugin interface
   GraphPlugin,
+  GraphPluginContext,
   EntityNode,
   GraphStats,
 

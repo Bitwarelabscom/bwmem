@@ -59,7 +59,7 @@ const MAIL_SMTP_SECURE = process.env.MAIL_SMTP_SECURE === 'true';
 const MAIL_SMTP_TLS_REJECT = process.env.MAIL_SMTP_TLS_REJECT_UNAUTHORIZED !== 'false';
 const KEY_ROTATION_GRACE_HOURS = parseInt(process.env.KEY_ROTATION_GRACE_HOURS ?? '24', 10);
 
-const VERSION = '0.2.1';
+const VERSION = '0.2.4';
 
 // ---- Startup validation (#2) ----
 
@@ -75,6 +75,21 @@ function validateConfig(): void {
   }
   if (!/^[a-z_][a-z0-9_]*$/i.test(TABLE_PREFIX)) {
     throw new Error('TABLE_PREFIX must contain only alphanumeric characters and underscores');
+  }
+  // MAIL_BASE_URL is embedded in verification and magic-link emails; a bad
+  // value (or one injected via compromised env) would redirect users to a
+  // phishing domain. Require a valid URL and enforce HTTPS in production.
+  let mailUrl: URL;
+  try {
+    mailUrl = new URL(MAIL_BASE_URL);
+  } catch {
+    throw new Error('MAIL_BASE_URL must be a valid URL');
+  }
+  if (mailUrl.protocol !== 'http:' && mailUrl.protocol !== 'https:') {
+    throw new Error('MAIL_BASE_URL must use http or https');
+  }
+  if (IS_PRODUCTION && mailUrl.protocol !== 'https:') {
+    throw new Error('MAIL_BASE_URL must use https in production');
   }
 }
 
@@ -170,12 +185,19 @@ export async function buildApp(): Promise<{
   // Active session tracking
   const activeSessions = new Map<string, ManagedSession>();
 
-  // Periodic stale session cleanup (#12)
+  // Periodic stale session cleanup — evict on inactivity rather than age.
+  // A session is stale if: (a) it has already ended, or (b) no request has
+  // touched it for INACTIVITY_MS. Ended sessions also self-evict via the
+  // onEnd() callback wired up in sessions.ts, so this is defense in depth.
+  const INACTIVITY_MS = 15 * 60_000; // 15 minutes
   const sessionCleanupInterval = setInterval(() => {
+    const now = Date.now();
     for (const [id, managed] of activeSessions) {
-      // Session.ended is private, so check if the session's DB row is inactive
-      // by checking if the session was created more than 10 min ago (2x inactivity timeout)
-      if (Date.now() - managed.createdAt.getTime() > 600_000) {
+      if (managed.session.isEnded) {
+        activeSessions.delete(id);
+        continue;
+      }
+      if (now - managed.lastActivityAt.getTime() > INACTIVITY_MS) {
         activeSessions.delete(id);
       }
     }
@@ -261,57 +283,13 @@ export async function buildApp(): Promise<{
   }, 5 * 60 * 1000);
   graceKeyCleanupInterval.unref();
 
-  // ---- Landing page ----
+  // ---- API info ----
 
-  app.get('/', async (_request, reply) => {
-    reply.type('text/html');
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bwmem API — BitwareLabs</title>
-<style>
-  *{margin:0;padding:0;box-sizing:border-box}
-  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;min-height:100vh;display:flex;align-items:center;justify-content:center}
-  .container{max-width:540px;padding:2rem;text-align:center}
-  h1{font-size:2.4rem;font-weight:700;letter-spacing:-0.02em;margin-bottom:0.25rem}
-  h1 span{color:#6366f1}
-  .tagline{color:#888;font-size:1.05rem;margin-bottom:2rem}
-  .version{display:inline-block;background:#1a1a2e;color:#6366f1;padding:0.2rem 0.7rem;border-radius:999px;font-size:0.8rem;font-weight:600;margin-bottom:2rem}
-  .links{display:flex;gap:1rem;justify-content:center;flex-wrap:wrap;margin-bottom:2rem}
-  .links a{color:#6366f1;text-decoration:none;padding:0.5rem 1.2rem;border:1px solid #6366f1;border-radius:8px;font-size:0.9rem;transition:all 0.15s}
-  .links a:hover{background:#6366f1;color:#fff}
-  .features{text-align:left;margin:2rem auto 0;max-width:380px}
-  .features li{padding:0.4rem 0;color:#aaa;font-size:0.9rem;list-style:none}
-  .features li::before{content:'→ ';color:#6366f1}
-  footer{margin-top:2.5rem;color:#555;font-size:0.8rem}
-  footer a{color:#666;text-decoration:none}
-  footer a:hover{color:#6366f1}
-</style>
-</head>
-<body>
-<div class="container">
-  <h1><span>bw</span>mem</h1>
-  <p class="tagline">Memory engine for AI chatbots</p>
-  <div class="links">
-    <a href="/api/v1/health">Health</a>
-    <a href="https://www.npmjs.com/package/@bitwarelabs/bwmem">npm</a>
-    <a href="https://github.com/bitwarelabscom/bwmem">GitHub</a>
-  </div>
-  <ul class="features">
-    <li>Semantic search with pgvector embeddings</li>
-    <li>Fact extraction &amp; contradiction detection</li>
-    <li>Emotional moment capture</li>
-    <li>Session-scoped context building</li>
-    <li>Knowledge graph (Neo4j)</li>
-    <li>Automatic memory consolidation</li>
-  </ul>
-  <footer>&copy; ${new Date().getFullYear()} <a href="https://bitwarelabs.com">BitwareLabs</a></footer>
-</div>
-</body>
-</html>`;
-  });
+  app.get('/', async () => ({
+    name: 'bwmem',
+    version: VERSION,
+    docs: !IS_PRODUCTION ? '/docs' : undefined,
+  }));
 
   // ---- Routes ----
 
@@ -356,7 +334,7 @@ export async function buildApp(): Promise<{
 
       // Health (no auth — auth hook skips /api/v1/health)
       await api.register(
-        (sub, _opts) => healthRoutes(sub, { pg: apiPg, redis }),
+        (sub, _opts) => healthRoutes(sub, { pg: apiPg, redis, bwmem }),
       );
 
       // Sessions
@@ -371,7 +349,7 @@ export async function buildApp(): Promise<{
 
       // Context
       await api.register(
-        (sub, _opts) => contextRoutes(sub, { bwmem }),
+        (sub, _opts) => contextRoutes(sub, { bwmem, activeSessions }),
       );
 
       // Search
@@ -421,7 +399,10 @@ export async function buildApp(): Promise<{
 
       // Admin routes
       await api.register(
-        (sub, _opts) => adminRoutes(sub, { pg: apiPg, tablePrefix: TABLE_PREFIX, invalidateTenant, audit: auditService }),
+        (sub, _opts) => adminRoutes(sub, {
+          pg: apiPg, tablePrefix: TABLE_PREFIX, invalidateTenant,
+          audit: auditService, magicLink: magicLinkService, email: emailService,
+        }),
         { prefix: '/admin' },
       );
     },

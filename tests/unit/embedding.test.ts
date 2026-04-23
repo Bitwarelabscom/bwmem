@@ -33,6 +33,20 @@ describe('EmbeddingService', () => {
       expect(r1).not.toEqual(r2);
       expect(provider.generateCalls).toHaveLength(2);
     });
+
+    it('does not collide when two texts share a long prefix', async () => {
+      // Two 2000-char strings that share the first 1000 chars but differ after.
+      // The previous cache key used text.slice(0, 1000) which collided here.
+      const shared = 'x'.repeat(1000);
+      const textA = shared + 'A'.repeat(1000);
+      const textB = shared + 'B'.repeat(1000);
+
+      const rA = await service.generate(textA);
+      const rB = await service.generate(textB);
+
+      expect(rA).not.toEqual(rB);
+      expect(provider.generateCalls).toHaveLength(2);
+    });
   });
 
   describe('generateBatch', () => {

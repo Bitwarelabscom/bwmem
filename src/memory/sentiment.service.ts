@@ -54,9 +54,11 @@ Return only {"valence": N, "arousal": N, "dominance": N}`,
   }
 
   private analyzeEmojis(content: string): SentimentResult | null {
-    const positiveEmojis = content.match(/[😊😄😃🥰❤️💕😍🎉✨👍💪🔥]/g);
-    const negativeEmojis = content.match(/[😢😭😞😠😡💔😤😰😱]/g);
-    const excitedEmojis = content.match(/[🎉🔥⚡🚀💥😱🤩]/g);
+    // Unicode flag (`u`) is required for astral-plane emoji in character
+    // classes so that surrogate pairs are matched as single code points.
+    const positiveEmojis = content.match(/[\u{1F60A}\u{1F604}\u{1F603}\u{1F970}\u{2764}\u{1F495}\u{1F60D}\u{1F389}\u{2728}\u{1F44D}\u{1F4AA}\u{1F525}]/gu);
+    const negativeEmojis = content.match(/[\u{1F622}\u{1F62D}\u{1F61E}\u{1F620}\u{1F621}\u{1F494}\u{1F624}\u{1F630}\u{1F631}]/gu);
+    const excitedEmojis = content.match(/[\u{1F389}\u{1F525}\u{26A1}\u{1F680}\u{1F4A5}\u{1F631}\u{1F929}]/gu);
 
     if (!positiveEmojis && !negativeEmojis && !excitedEmojis) return null;
 
