@@ -1,7 +1,7 @@
 {
   "name": "@bitwarelabs/bwmem",
-  "version": "0.2.4",
-  "description": "Memory SDK for AI chatbots - facts, embeddings, semantic search, emotional capture, consolidation",
+  "version": "0.3.0",
+  "description": "Memory SDK for AI chatbots - bi-temporal facts, semantic search, emotional capture, contradiction detection, quality scoring, session texture, self-intentions, multi-stage consolidation",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -49,10 +49,23 @@
     "semantic-search",
     "facts",
     "pgvector",
+    "bi-temporal",
+    "contradiction-detection",
+    "quality-scoring",
+    "session-texture",
     "consolidation"
   ],
-  "author": "BitwareLabs",
+  "author": "Henrik Robertsson <henke@bitwarelabs.com> (https://bitwarelabs.com/)",
   "license": "AGPL-3.0-only",
+  "homepage": "https://bitwarelabs.com/bwmem",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bitwarelabscom/bwmem.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Bitwarelabscom/bwmem/issues",
+    "email": "henke@bitwarelabs.com"
+  },
   "dependencies": {
     "@fastify/cors": "^11.2.0",
     "@fastify/helmet": "^13.0.2",
