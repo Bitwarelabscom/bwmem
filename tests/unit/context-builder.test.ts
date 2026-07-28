@@ -9,6 +9,8 @@ import { EmbeddingService } from '../../src/memory/embedding.service.js';
 import { EmotionalMomentsService } from '../../src/memory/emotional-moments.service.js';
 import { ContradictionService } from '../../src/memory/contradiction.service.js';
 import { BehavioralService } from '../../src/memory/behavioral.service.js';
+import { SessionTextureService } from '../../src/memory/session-texture.service.js';
+import { SelfIntentionService } from '../../src/memory/self-intention.service.js';
 
 describe('ContextBuilder', () => {
   let pg: MockPgClient;
@@ -23,9 +25,12 @@ describe('ContextBuilder', () => {
     const emotional = new EmotionalMomentsService(pg as never, llm, 'bwmem_', mockLogger);
     const contradictions = new ContradictionService(pg as never, 'bwmem_', mockLogger);
     const behavioral = new BehavioralService(pg as never, 'bwmem_', mockLogger);
+    const sessionTexture = new SessionTextureService(pg as never, llm, 'bwmem_', mockLogger);
+    const selfIntention = new SelfIntentionService(pg as never, 'bwmem_', mockLogger);
 
     builder = new ContextBuilder(
       pg as never, facts, embedding, emotional, contradictions, behavioral,
+      sessionTexture, selfIntention,
       null, // no graph
       'bwmem_', mockLogger,
     );

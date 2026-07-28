@@ -4,6 +4,8 @@ import type { EmbeddingService } from './embedding.service.js';
 import type { EmotionalMomentsService } from './emotional-moments.service.js';
 import type { ContradictionService } from './contradiction.service.js';
 import type { BehavioralService } from './behavioral.service.js';
+import type { SessionTextureService } from './session-texture.service.js';
+import type { SelfIntentionService } from './self-intention.service.js';
 import type { GraphPlugin, Logger, MemoryContext, BuildContextOptions, EpisodicPattern, SemanticEntry } from '../types.js';
 import { safeQuery } from '../utils/safe-query.js';
 
@@ -16,15 +18,24 @@ export class ContextBuilder {
   private emotionalMoments: EmotionalMomentsService;
   private contradictions: ContradictionService;
   private behavioral: BehavioralService;
+  private sessionTexture: SessionTextureService;
+  private selfIntention: SelfIntentionService;
   private graph: GraphPlugin | null;
   private prefix: string;
   private logger: Logger;
 
   constructor(
-    pg: PgClient, facts: FactsService, embedding: EmbeddingService,
-    emotionalMoments: EmotionalMomentsService, contradictions: ContradictionService,
+    pg: PgClient,
+    facts: FactsService,
+    embedding: EmbeddingService,
+    emotionalMoments: EmotionalMomentsService,
+    contradictions: ContradictionService,
     behavioral: BehavioralService,
-    graph: GraphPlugin | null, prefix: string, logger: Logger,
+    sessionTexture: SessionTextureService,
+    selfIntention: SelfIntentionService,
+    graph: GraphPlugin | null,
+    prefix: string,
+    logger: Logger,
   ) {
     this.pg = pg;
     this.facts = facts;
@@ -32,6 +43,8 @@ export class ContextBuilder {
     this.emotionalMoments = emotionalMoments;
     this.contradictions = contradictions;
     this.behavioral = behavioral;
+    this.sessionTexture = sessionTexture;
+    this.selfIntention = selfIntention;
     this.graph = graph;
     this.prefix = prefix;
     this.logger = logger;
@@ -42,8 +55,11 @@ export class ContextBuilder {
     const timeout = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const query = options?.query;
     const sessionId = options?.sessionId;
+    const mode = options?.mode;
+    const speaker = options?.speaker;
+    const includeSessionTexture = options?.includeSessionTexture !== false;
+    const includeIntention = options?.includeIntentionPrompt === true;
 
-    // Run all sources in parallel with timeout protection
     const results = await Promise.allSettled([
       safeQuery('facts', this.facts.getUserFacts(userId, undefined, options?.maxFacts ?? 30), [], timeout, this.logger),
       safeQuery('similarMessages', query
@@ -58,33 +74,42 @@ export class ContextBuilder {
       safeQuery('episodic', this.getEpisodicPatterns(userId), [], timeout, this.logger),
       safeQuery('semantic', this.getSemanticKnowledge(userId), [], timeout, this.logger),
       safeQuery('graph', this.graph ? this.graph.getContext(userId) : Promise.resolve(null), null, timeout, this.logger),
+      safeQuery('sessionTexture', includeSessionTexture
+        ? this.sessionTexture.getForPrompt(userId, { mode, speaker })
+        : Promise.resolve(''), '', timeout, this.logger),
+      // Intention surfacing has a side effect (defer_count bump). Caller must
+      // opt in explicitly via `includeIntentionPrompt: true` — never run it
+      // from a hot read path that may fire many times per session.
+      safeQuery('intentionPrompt', includeIntention
+        ? this.selfIntention.getPrompt(userId, { timezone: options?.timezone })
+        : Promise.resolve(''), '', timeout, this.logger),
     ]);
 
-    // Extract values (safeQuery wraps in {value, ok})
-    const extract = <T>(idx: number): T => {
+    const extract = <T>(idx: number, fallback: T): T => {
       const r = results[idx];
       if (r.status === 'fulfilled') return r.value.value as T;
-      return ([] as unknown) as T;
+      return fallback;
     };
 
-    const factsResult = extract<Awaited<ReturnType<FactsService['getUserFacts']>>>(0);
-    const similarMessages = extract<Awaited<ReturnType<EmbeddingService['searchSimilarMessages']>>>(1);
-    const similarConversations = extract<Awaited<ReturnType<EmbeddingService['searchSimilarConversations']>>>(2);
-    const emotionalMoments = extract<Awaited<ReturnType<EmotionalMomentsService['getRecent']>>>(3);
-    const contradictionsList = extract<Awaited<ReturnType<ContradictionService['getUnsurfaced']>>>(4);
-    const behavioralObs = extract<Awaited<ReturnType<BehavioralService['getActive']>>>(5);
-    const episodicPatterns = extract<EpisodicPattern[]>(6);
-    const semanticKnowledge = extract<SemanticEntry[]>(7);
-    const graphContext = extract<string | null>(8);
+    const factsResult = extract<Awaited<ReturnType<FactsService['getUserFacts']>>>(0, []);
+    const similarMessages = extract<Awaited<ReturnType<EmbeddingService['searchSimilarMessages']>>>(1, []);
+    const similarConversations = extract<Awaited<ReturnType<EmbeddingService['searchSimilarConversations']>>>(2, []);
+    const emotionalMoments = extract<Awaited<ReturnType<EmotionalMomentsService['getRecent']>>>(3, []);
+    const contradictionsList = extract<Awaited<ReturnType<ContradictionService['getUnsurfaced']>>>(4, []);
+    const behavioralObs = extract<Awaited<ReturnType<BehavioralService['getActive']>>>(5, []);
+    const episodicPatterns = extract<EpisodicPattern[]>(6, []);
+    const semanticKnowledge = extract<SemanticEntry[]>(7, []);
+    const graphContext = extract<string | null>(8, null);
+    const textureBlock = extract<string>(9, '');
+    const intentionBlock = extract<string>(10, '');
 
-    // Count how many sources responded
     const responded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
     const total = results.length;
 
-    // Build formatted context string
     const formatted = this.format(
       factsResult, similarMessages, emotionalMoments, contradictionsList,
       behavioralObs, episodicPatterns, semanticKnowledge, graphContext,
+      textureBlock, intentionBlock,
     );
 
     return {
@@ -97,6 +122,8 @@ export class ContextBuilder {
       episodicPatterns,
       semanticKnowledge,
       graphContext: graphContext ?? undefined,
+      sessionTexture: textureBlock || undefined,
+      intentionPrompt: intentionBlock || undefined,
       formatted,
       sourcesResponded: `${responded}/${total}`,
     };
@@ -111,8 +138,13 @@ export class ContextBuilder {
     episodic: EpisodicPattern[],
     semantic: SemanticEntry[],
     graphContext: string | null,
+    sessionTexture: string,
+    intentionPrompt: string,
   ): string {
     const sections: string[] = [];
+
+    // Texture leads (carries the felt momentum from the last session).
+    if (sessionTexture) sections.push(sessionTexture);
 
     if (facts.length > 0) {
       sections.push(`## Known Facts\n${this.facts.formatForPrompt(facts)}`);
@@ -120,7 +152,7 @@ export class ContextBuilder {
 
     if (similarMessages.length > 0) {
       const msgs = similarMessages
-        .map(m => `- "${m.content.slice(0, 100)}..." (${(m.similarity * 100).toFixed(0)}% match)`)
+        .map(m => `- "${m.content.length > 300 ? m.content.slice(0, 300) + '…' : m.content}" (${(m.similarity * 100).toFixed(0)}% match)`)
         .join('\n');
       sections.push(`## Relevant Past Messages\n${msgs}`);
     }
@@ -150,6 +182,8 @@ export class ContextBuilder {
     if (graphContext) {
       sections.push(`## Knowledge Graph\n${graphContext}`);
     }
+
+    if (intentionPrompt) sections.push(intentionPrompt);
 
     return sections.join('\n\n');
   }

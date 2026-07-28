@@ -92,6 +92,18 @@ export const storeFactSchema = z.object({
   validFrom: z.string().datetime().optional(),
   validUntil: z.string().datetime().optional(),
   sessionId: z.string().uuid().optional(),
+  intentId: z.string().uuid().nullable().optional(),
+  isCorrection: z.boolean().optional(),
+});
+
+export const factsQuerySchema = z.object({
+  category: z.string().max(100).optional(),
+  limit: z.coerce.number().int().positive().max(500).optional(),
+  intentId: z.string().uuid().optional(),
+  /** Bi-temporal: ISO-8601 timestamp. If set, returns facts believed at this transaction time. */
+  asOfTxnTime: z.string().datetime().optional(),
+  /** Bi-temporal: ISO-8601 timestamp. If set, returns facts true at this valid time. */
+  asOfValidTime: z.string().datetime().optional(),
 });
 
 export const deleteFactParamsSchema = z.object({
@@ -202,6 +214,80 @@ export const updateTenantSchema = z.object({
 
 export const tenantIdParamsSchema = z.object({
   id: z.string().uuid(),
+});
+
+// ---- Quality scoring ----
+
+export const qualityScoreSchema = z.object({
+  messageId: z.string().uuid(),
+  userId: z.string().min(1).max(255),
+  sessionId: z.string().uuid(),
+  mode: z.string().max(100).optional(),
+  responseContent: z.string().min(1).max(50_000),
+});
+
+export const qualityFollowupSchema = z.object({
+  userId: z.string().min(1).max(255),
+  sessionId: z.string().uuid(),
+  previousAssistantMessageId: z.string().uuid(),
+  previousAssistantCreatedAt: z.string().datetime(),
+  nextUserContent: z.string().min(1).max(50_000),
+  nextUserCreatedAt: z.string().datetime(),
+});
+
+export const qualityStatsParamsSchema = z.object({
+  userId: z.string().min(1).max(255),
+});
+
+export const qualityStatsQuerySchema = z.object({
+  since: z.string().datetime().optional(),
+  mode: z.string().max(100).optional(),
+  limit: z.coerce.number().int().positive().max(100).optional(),
+});
+
+// ---- Session texture ----
+
+export const textureParamsSchema = z.object({
+  userId: z.string().min(1).max(255),
+});
+
+export const textureQuerySchema = z.object({
+  mode: z.string().max(100).optional(),
+  speaker: z.string().max(100).optional(),
+});
+
+export const captureTextureSchema = z.object({
+  sessionId: z.string().uuid(),
+  mode: z.string().max(100).optional(),
+  speaker: z.string().max(100).optional(),
+});
+
+// ---- Self-intention ----
+
+export const intentionParamsSchema = z.object({
+  userId: z.string().min(1).max(255),
+});
+
+export const intentionIdParamsSchema = z.object({
+  id: z.string().uuid(),
+});
+
+export const saveIntentionSchema = z.object({
+  userId: z.string().min(1).max(255),
+  intention: z.string().min(1).max(600),
+  note: z.string().max(600).optional(),
+});
+
+export const resolveIntentionSchema = z.object({
+  userId: z.string().min(1).max(255),
+  status: z.enum(['done', 'let_go']),
+  id: z.string().uuid().optional(),
+  note: z.string().max(600).optional(),
+});
+
+export const intentionPromptQuerySchema = z.object({
+  timezone: z.string().max(100).optional(),
+  deferLimit: z.coerce.number().int().positive().max(20).optional(),
 });
 
 // ---- Inferred request/response types ----

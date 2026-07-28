@@ -24,6 +24,9 @@ import { contradictionRoutes } from './routes/contradictions.js';
 import { consolidationRoutes } from './routes/consolidation.js';
 import { summaryRoutes } from './routes/summary.js';
 import { graphRoutes } from './routes/graph.js';
+import { qualityRoutes } from './routes/quality.js';
+import { textureRoutes } from './routes/textures.js';
+import { intentionRoutes } from './routes/intentions.js';
 import { adminRoutes } from './routes/admin.js';
 import { authRoutes } from './routes/auth.js';
 import { accountRoutes } from './routes/account.js';
@@ -36,12 +39,29 @@ import type { Logger } from '../types.js';
 // ---- Config from env ----
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
+// Bind host — explicit override always wins. Without HOST set, dev binds to
+// 0.0.0.0 (any interface) and production binds to 127.0.0.1 (localhost-only),
+// the previous defaults. Set HOST to a tunnel address to bind VPN-only.
+const HOST = process.env.HOST ?? (process.env.NODE_ENV === 'production' ? '127.0.0.1' : '0.0.0.0');
 const DATABASE_URL = process.env.DATABASE_URL ?? '';
 const REDIS_URL = process.env.REDIS_URL ?? '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY ?? '';
 const OPENROUTER_EMBEDDING_MODEL = process.env.OPENROUTER_EMBEDDING_MODEL ?? 'openai/text-embedding-3-small';
 const OPENROUTER_CHAT_MODEL = process.env.OPENROUTER_CHAT_MODEL ?? 'anthropic/claude-3.5-haiku';
 const OPENROUTER_EMBEDDING_DIMENSIONS = parseInt(process.env.OPENROUTER_EMBEDDING_DIMENSIONS ?? '1536', 10);
+// Provider selection: 'openrouter' (default, cloud) or 'ollama' (local, cloud-free).
+const LLM_PROVIDER = (process.env.LLM_PROVIDER ?? 'openrouter').toLowerCase();
+// Default to the address ollama actually listens on out of the box. Anything
+// else (a GPU box on a private mesh, a remote host) is deployment-specific
+// and belongs in OLLAMA_BASE_URL, not in a published default.
+const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434';
+const OLLAMA_CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? 'qwen2.5:7b';
+const OLLAMA_EMBEDDING_MODEL = process.env.OLLAMA_EMBEDDING_MODEL ?? 'bge-m3';
+const OLLAMA_EMBEDDING_DIMENSIONS = parseInt(process.env.OLLAMA_EMBEDDING_DIMENSIONS ?? '1024', 10);
+// Optional: run embeddings on a SEPARATE ollama so recall-embedding isn't
+// starved by the heavy chat/extraction model on a shared CPU. Falls back to
+// OLLAMA_BASE_URL if unset.
+const EMBED_OLLAMA_BASE_URL = process.env.EMBED_OLLAMA_BASE_URL ?? OLLAMA_BASE_URL;
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY ?? '';
 const LOG_LEVEL = process.env.LOG_LEVEL ?? 'info';
 const TABLE_PREFIX = process.env.TABLE_PREFIX ?? 'bwmem_';
@@ -59,7 +79,7 @@ const MAIL_SMTP_SECURE = process.env.MAIL_SMTP_SECURE === 'true';
 const MAIL_SMTP_TLS_REJECT = process.env.MAIL_SMTP_TLS_REJECT_UNAUTHORIZED !== 'false';
 const KEY_ROTATION_GRACE_HOURS = parseInt(process.env.KEY_ROTATION_GRACE_HOURS ?? '24', 10);
 
-const VERSION = '0.2.4';
+const VERSION = '0.3.0';
 
 // ---- Startup validation (#2) ----
 
@@ -145,15 +165,34 @@ export async function buildApp(): Promise<{
   // Redis client (shared with rate limiter)
   const redis = new RedisClient(REDIS_URL, sdkLogger);
 
-  // Embedding + LLM providers (tracked for usage)
-  const openrouter = new OpenRouterProvider({
-    apiKey: OPENROUTER_API_KEY,
-    embeddingModel: OPENROUTER_EMBEDDING_MODEL,
-    model: OPENROUTER_CHAT_MODEL,
-    embeddingDimensions: OPENROUTER_EMBEDDING_DIMENSIONS,
-  });
-  const trackedEmbed = new TrackedEmbeddingProvider(openrouter, apiPg, TABLE_PREFIX, sdkLogger);
-  const trackedLLM = new TrackedLLMProvider(openrouter);
+  // Embedding + LLM providers (tracked for usage).
+  // LLM_PROVIDER=ollama keeps everything local (100% cloud-free); default stays OpenRouter.
+  let llmProvider: import('../types.js').LLMProvider;
+  let embedProvider: import('../types.js').EmbeddingProvider;
+  if (LLM_PROVIDER === 'ollama') {
+    const { OllamaProvider } = await import('../providers/ollama.js');
+    llmProvider = new OllamaProvider({
+      baseUrl: OLLAMA_BASE_URL, model: OLLAMA_CHAT_MODEL,
+      embeddingModel: OLLAMA_EMBEDDING_MODEL, embeddingDimensions: OLLAMA_EMBEDDING_DIMENSIONS,
+    });
+    // dedicated embedding provider (may point at a different, uncontended ollama)
+    embedProvider = new OllamaProvider({
+      baseUrl: EMBED_OLLAMA_BASE_URL, model: OLLAMA_CHAT_MODEL,
+      embeddingModel: OLLAMA_EMBEDDING_MODEL, embeddingDimensions: OLLAMA_EMBEDDING_DIMENSIONS,
+    });
+    app.log.info(
+      { chatUrl: OLLAMA_BASE_URL, embedUrl: EMBED_OLLAMA_BASE_URL, chat: OLLAMA_CHAT_MODEL, embed: OLLAMA_EMBEDDING_MODEL, dims: OLLAMA_EMBEDDING_DIMENSIONS },
+      'Using local Ollama provider (cloud-free)'
+    );
+  } else {
+    const openrouter = new OpenRouterProvider({
+      apiKey: OPENROUTER_API_KEY, embeddingModel: OPENROUTER_EMBEDDING_MODEL,
+      model: OPENROUTER_CHAT_MODEL, embeddingDimensions: OPENROUTER_EMBEDDING_DIMENSIONS,
+    });
+    llmProvider = openrouter; embedProvider = openrouter;
+  }
+  const trackedEmbed = new TrackedEmbeddingProvider(embedProvider, apiPg, TABLE_PREFIX, sdkLogger);
+  const trackedLLM = new TrackedLLMProvider(llmProvider);
 
   // Neo4j graph plugin (optional)
   let graphPlugin: import('../types.js').GraphPlugin | undefined;
@@ -211,9 +250,10 @@ export async function buildApp(): Promise<{
     contentSecurityPolicy: IS_PRODUCTION ? undefined : false, // Disable CSP in dev for Swagger UI
   });
 
-  // CORS — explicit origin allowlist in production (#6)
+  // CORS — public API behind Bearer auth, so allow any origin by default.
+  // Setting CORS_ORIGINS still overrides this with an explicit allowlist.
   await app.register(import('@fastify/cors'), {
-    origin: CORS_ORIGINS ? CORS_ORIGINS.split(',').map(s => s.trim()) : !IS_PRODUCTION,
+    origin: CORS_ORIGINS ? CORS_ORIGINS.split(',').map(s => s.trim()) : true,
     methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization'],
     exposedHeaders: ['X-Embedding-Limit', 'X-Embedding-Remaining', 'X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
@@ -387,6 +427,21 @@ export async function buildApp(): Promise<{
         (sub, _opts) => graphRoutes(sub, { graph: graphPlugin }),
       );
 
+      // Quality (per-response output_integrity + interaction_vitality)
+      await api.register(
+        (sub, _opts) => qualityRoutes(sub, { bwmem }),
+      );
+
+      // Session texture (carryover anchor)
+      await api.register(
+        (sub, _opts) => textureRoutes(sub, { bwmem }),
+      );
+
+      // Self-intentions (held things-to-do)
+      await api.register(
+        (sub, _opts) => intentionRoutes(sub, { bwmem }),
+      );
+
       // Account (self-service)
       await api.register(
         (sub, _opts) => accountRoutes(sub, {
@@ -445,8 +500,8 @@ export async function startServer(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   try {
-    await app.listen({ port: PORT, host: IS_PRODUCTION ? '127.0.0.1' : '0.0.0.0' });
-    app.log.info(`bwmem API v${VERSION} listening on port ${PORT}`);
+    await app.listen({ port: PORT, host: HOST });
+    app.log.info(`bwmem API v${VERSION} listening on ${HOST}:${PORT}`);
     if (!IS_PRODUCTION) {
       app.log.info(`Swagger docs at http://localhost:${PORT}/docs`);
     }

@@ -1,24 +1,29 @@
 # @bitwarelabs/bwmem
 
-Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: facts, semantic search, emotional capture, contradiction detection, knowledge graph, and multi-stage consolidation.
+Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: bi-temporal facts, semantic search, emotional capture, contradiction detection, quality scoring, session-texture carryover, held intentions, knowledge graph, and multi-stage consolidation.
 
-Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, and long-term memory consolidation in the background.
+Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, response quality scoring, and long-term memory consolidation in the background.
 
-**v0.2.0** adds a hosted REST API layer, multi-tenant support, and a Neo4j knowledge graph pipeline.
+**v0.3.0** adds bi-temporal facts, embedding-based semantic dedup, inline contradiction detection, response quality scoring (output integrity vs interaction vitality), session-texture carryover, and held self-intentions.
 
 ## Features
 
+- **Bi-temporal facts** — facts track both *valid-time* (when something was true in the world) and *transaction-time* (when we believed it). Lets you answer "what did we believe on date Y about state on date X?" not just "what was true on date Y."
 - **Fact extraction** — automatically extracts structured facts from conversations (name, job, preferences, relationships, career signals)
+- **Semantic dedup** — exact-key dedup + embedding-based similarity collapse for autonomous save paths that re-emit the same idea under different keys
+- **Volatile/ephemeral guards** — fact keys like `current_*`, schedules, sleep/wake times, and speaker references are caught structurally so they cannot bleed across sessions or generate spurious contradiction signals
 - **Semantic search** — find similar messages and conversations via pgvector embeddings
 - **Emotional capture** — detects high-emotion moments using VAD (Valence-Arousal-Dominance) analysis with specific descriptive tags
-- **Contradiction detection** — LLM-powered detection of behavioral contradictions across sessions, with awareness of multi-valued facts and temporal context
+- **Contradiction detection** — both async (on fact supersession) and **inline** (real-time, zero-I/O scan during message ingestion), with stopword and volatile-key filtering to dampen false positives
+- **Quality scoring** — per-response scoring split into `output_integrity` (the agent's own quality: relevance, coherence, memory fidelity, generativity, completeness) and `interaction_vitality` (engagement: reply speed, length, feedback class). Engagement noise no longer drags down the agent's self-score.
+- **Session texture** — captures the *throughline* (what was being worked through) and *emotional register* of a session at close; surfaces as an anchor on the next session in the same (mode, speaker) pair. Hands the next session momentum, not just facts.
+- **Self-intentions** — held things-to-do with deliberate save, daily surfacing, and a 3-deferral do-or-let-go ceiling. Mirror, not gate.
 - **Memory consolidation** — episodic (per-session), daily, and weekly consolidation pipelines
 - **Conversation summaries** — auto-generated summaries with topic extraction
-- **Context builder** — aggregates 9 memory sources into a single formatted prompt injection
+- **Context builder** — aggregates 11 memory sources into a single formatted prompt injection
 - **Knowledge graph** — Neo4j integration with schema-constrained entity relationships (27 types), entity-to-entity edges, and entity-scoped subgraphs
 - **Provider-agnostic** — works with OpenAI, Ollama, OpenRouter, or any custom provider
 - **REST API** — Fastify-based multi-tenant API with API key auth, rate limiting, usage tracking, and Swagger docs
-- **Semantic fact dedup** — normalized key comparison + value similarity prevents duplicate facts across extraction batches
 
 ## Requirements
 
@@ -66,22 +71,137 @@ const response = await provider.chat([
   { role: 'user', content: 'What do you know about me?' },
 ]);
 
-// End session (triggers episodic consolidation)
+// End session (triggers episodic consolidation + texture capture)
 await session.end();
+await mem.textures.capture(session.id); // anchor for the next session
+
 await mem.shutdown();
+```
+
+## What's new in 0.3.0
+
+### Bi-temporal facts
+
+Every fact now carries two time axes:
+
+- `validFrom` / `validUntil` — when the fact was true in the world (existing)
+- `recordedAt` — when we first wrote this belief
+- `supersededAt` — when we stopped believing it (NULL while believed)
+
+```typescript
+// "What did we believe at txn time about state at valid time?"
+const past = await mem.facts.getAsOf(
+  'user-123',
+  new Date('2026-03-01'),  // asOfValidTime
+  new Date('2026-04-01'),  // asOfTxnTime
+);
+```
+
+The supersession path stamps `supersededAt = NOW()` and writes a row to `fact_corrections` — an append-only audit log of every belief change.
+
+### Semantic dedup + volatile guards
+
+```typescript
+// Embedding-based dedup for autonomous loops that re-save the same idea.
+const match = await mem.facts.findSimilar('user-123', 'I prefer dark mode in my editor');
+if (match) {
+  await mem.facts.touchMention(match.id);   // collapse the new write
+} else {
+  await mem.facts.store({ /* ... */ });      // genuinely new
+}
+```
+
+Three structural guards run before storage:
+
+```typescript
+import { isSpeakerFact, isEphemeralFactKey, isVolatileFactKey } from '@bitwarelabs/bwmem';
+
+isSpeakerFact('current_speaker')       // true — drop, never persist
+isEphemeralFactKey('current_drink')    // true — force to 12h temporary
+isVolatileFactKey('work_schedule')     // true — store but no contradiction signal
+```
+
+### Inline contradiction detection
+
+A pure-synchronous, zero-I/O scan runs during message ingestion:
+
+```typescript
+const facts = await mem.facts.get('user-123');
+const inlines = mem.contradictions.detectInline(message.content, facts);
+// inlines[0] = { factKey: 'partner_name', storedValue: 'Alice', suspectedValue: 'Beth' }
+```
+
+Stopword filter excludes sentence-initial words ("I", "My", "The", "Hey", …) and the scan skips volatile keys.
+
+### Quality scoring
+
+Per-response scoring split into two honest numbers:
+
+```typescript
+// Phase 1: deterministic floor at message save
+await mem.quality.scoreResponse({
+  messageId, userId, sessionId, mode, responseContent,
+});
+
+// Phase 2: interaction vitality at user reply
+await mem.quality.resolveFollowup({
+  userId, sessionId,
+  previousAssistantMessageId, previousAssistantCreatedAt,
+  nextUserContent, nextUserCreatedAt,
+});
+
+// Phase 3: periodic LLM self-check (cron)
+await mem.quality.runSelfCheck(8);
+
+// Aggregate
+const stats = await mem.quality.getStats('user-123', { since });
+// → { averageOutputIntegrity: 0.83, averageInteractionVitality: 0.41, ... }
+```
+
+`output_integrity` is the agent's own quality (relevance, coherence, memory_fidelity, generativity, completeness_honesty). `interaction_vitality` is engagement (reply speed, length, feedback class). Reply latency never touches integrity.
+
+### Session texture
+
+Captures the throughline + emotional register of a session at close, surfaces it as an anchor on the next session in the same (mode, speaker) pair.
+
+```typescript
+// On session end:
+await mem.textures.capture(sessionId, { mode: 'companion', speaker: 'user' });
+
+// On next session open (or inside buildContext with includeSessionTexture):
+const anchor = await mem.textures.getForPrompt('user-123', {
+  mode: 'companion', speaker: 'user',
+});
+// → "Where you left off (companion session, 3h ago):
+//      Throughline: figuring out whether to push the launch by a week
+//      Emotional register: tense, problem-solving, edging toward decisive"
+```
+
+Captures are fire-and-forget — they never block a session ending. 72h freshness taper.
+
+### Self-intentions
+
+Held things-to-do with daily surfacing and a 3-deferral do-or-let-go ceiling.
+
+```typescript
+await mem.intentions.save('user-123', 'Reach out to old mentor', 'After the launch settles');
+
+// Once per day in your wake/idle loop (SIDE EFFECT: bumps defer_count):
+const prompt = await mem.intentions.getPrompt('user-123', { timezone: 'Europe/Stockholm' });
+
+await mem.intentions.resolve('user-123', 'done');     // or 'let_go' — same dignity
+const open = await mem.intentions.listOpen('user-123');
 ```
 
 ## REST API
 
-v0.2.0 includes a hosted REST API layer for multi-tenant access to all SDK features.
+v0.3.0 retains the multi-tenant REST API layer.
 
 ### Running the API
 
 ```bash
-# With Docker
 docker compose up -d
-
-# Or directly
+# or
 npm run start:api
 ```
 
@@ -93,7 +213,7 @@ DATABASE_URL=postgresql://bwmem:password@localhost:5432/bwmem
 REDIS_URL=redis://:password@localhost:6379
 OPENROUTER_API_KEY=sk-or-...
 OPENROUTER_EMBEDDING_MODEL=openai/text-embedding-3-large
-OPENROUTER_CHAT_MODEL=google/gemma-4-31b-it
+OPENROUTER_CHAT_MODEL=anthropic/claude-3.5-haiku
 OPENROUTER_EMBEDDING_DIMENSIONS=1536
 ADMIN_API_KEY=your-admin-key-min-32-chars
 API_KEY_PEPPER=your-secret-pepper
@@ -115,12 +235,24 @@ All endpoints under `/api/v1/`. Auth via `Authorization: Bearer <key>`.
 | `POST` | `/messages` | Record a message |
 | `GET` | `/context?userId=&query=` | Build memory context |
 | `GET` | `/search?userId=&query=&type=` | Semantic search |
-| `GET` | `/facts/:userId` | Get facts |
+| `GET` | `/facts/:userId` | Get facts (`?asOfTxnTime=&asOfValidTime=` for bi-temporal) |
 | `POST` | `/facts` | Store a fact |
 | `DELETE` | `/facts/:factId` | Delete a fact |
 | `GET` | `/facts/:userId/search?query=` | Search facts |
 | `GET` | `/emotions/:userId` | Emotional moments |
 | `GET` | `/contradictions/:userId` | Contradictions |
+| `POST` | `/quality/score` | Score a response (phase 1) |
+| `POST` | `/quality/followup` | Resolve followup (phase 2) |
+| `GET` | `/quality/:userId/stats` | Quality aggregates |
+| `GET` | `/textures/:userId` | Latest session texture row |
+| `GET` | `/textures/:userId/prompt` | Texture as prompt anchor |
+| `POST` | `/textures` | Capture texture for a session |
+| `GET` | `/intentions/:userId` | List open intentions |
+| `GET` | `/intentions/:userId/all` | List all intentions |
+| `GET` | `/intentions/:userId/prompt` | Surface oldest open (side effect) |
+| `POST` | `/intentions` | Save a new intention |
+| `POST` | `/intentions/resolve` | Resolve (done / let_go) |
+| `DELETE` | `/intentions/:id` | Resolve as let_go |
 | `POST` | `/consolidate` | Trigger consolidation (admin) |
 | `GET` | `/summary/:sessionId` | Conversation summary |
 | `GET` | `/graph/:userId` | Knowledge graph |
@@ -138,8 +270,6 @@ All endpoints under `/api/v1/`. Auth via `Authorization: Bearer <key>`.
 | Enterprise | Custom | Custom | Custom | Contact us |
 
 ### Response Format
-
-All responses follow a consistent envelope:
 
 ```json
 { "success": true, "data": { ... } }
@@ -170,7 +300,12 @@ curl -X POST https://api.bitwarelabs.com/api/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"sessionId": "...", "role": "user", "content": "My name is Vera and I live in Gothenburg"}'
 
-curl https://api.bitwarelabs.com/api/v1/facts/user-1 \
+# Bi-temporal query
+curl "https://api.bitwarelabs.com/api/v1/facts/user-1?asOfTxnTime=2026-04-01T00:00:00Z" \
+  -H "Authorization: Bearer $API_KEY"
+
+# Quality stats
+curl "https://api.bitwarelabs.com/api/v1/quality/user-1/stats" \
   -H "Authorization: Bearer $API_KEY"
 ```
 
@@ -197,10 +332,10 @@ const provider = new OpenAIProvider({
 import { OllamaProvider } from '@bitwarelabs/bwmem/providers/ollama';
 
 const provider = new OllamaProvider({
-  baseUrl: 'http://localhost:11434', // default
-  model: 'llama3',                   // default
+  baseUrl: 'http://localhost:11434',  // default
+  model: 'llama3',                    // default
   embeddingModel: 'nomic-embed-text', // default
-  embeddingDimensions: 768,          // default
+  embeddingDimensions: 768,           // default
 });
 ```
 
@@ -218,8 +353,6 @@ const provider = new OpenRouterProvider({
 ```
 
 ### Custom provider
-
-Implement the interfaces directly:
 
 ```typescript
 import type { EmbeddingProvider, LLMProvider } from '@bitwarelabs/bwmem';
@@ -273,46 +406,102 @@ const session = await mem.startSession({
 
 #### `mem.buildContext(userId, options?): Promise<MemoryContext>`
 
-Aggregates memory from 9 sources in parallel with timeout protection:
+Aggregates 11 sources in parallel, each guarded by a per-source timeout.
 
 ```typescript
 const context = await mem.buildContext('user-123', {
   query: 'What does the user do for work?',
-  sessionId: session.id,        // exclude current session
-  maxFacts: 30,                 // default
-  maxSimilarMessages: 5,        // default
-  similarityThreshold: 0.25,    // default (tuned for text-embedding-3-large)
-  timeoutMs: 5000,              // default
+  sessionId: session.id,        // exclude current session from similar-message search
+  maxFacts: 30,
+  maxSimilarMessages: 5,
+  similarityThreshold: 0.25,
+  timeoutMs: 5000,
+  mode: 'companion',             // session-texture selector
+  speaker: 'user',
+  includeSessionTexture: true,   // default true
+  includeIntentionPrompt: false, // default false — surfacing has side effects
+  timezone: 'Europe/Stockholm',  // for the intention daily gate
 });
 
 // context.formatted — ready to inject into your system prompt
 // context.facts — array of Fact objects
-// context.sourcesResponded — e.g. "9/9"
+// context.sessionTexture — anchor block, if any
+// context.intentionPrompt — daily surface, if requested and due
+// context.sourcesResponded — e.g. "11/11"
 ```
-
-**Sources:** facts, similar messages, similar conversations, emotional moments, contradictions, behavioral observations, episodic patterns, semantic knowledge, graph context.
 
 #### `mem.facts`
 
 ```typescript
-const facts = await mem.facts.get('user-123');
-await mem.facts.store({ userId: 'user-123', category: 'preference', key: 'editor', value: 'VS Code' });
+const facts = await mem.facts.get('user-123', { category: 'work', limit: 30 });
+
+const asOf = await mem.facts.getAsOf(
+  'user-123',
+  new Date('2026-03-01'),  // valid time
+  new Date('2026-04-01'),  // txn time (default: now)
+);
+
+await mem.facts.store({
+  userId: 'user-123', category: 'preference',
+  key: 'editor', value: 'VS Code',
+  intentId: null,        // unscoped fact (default)
+});
+
+const match = await mem.facts.findSimilar('user-123', 'I love VS Code', { threshold: 0.9 });
+if (match) await mem.facts.touchMention(match.id);
+
 const results = await mem.facts.search('user-123', 'programming tools');
 await mem.facts.remove(factId);
+await mem.facts.expireTemporary(); // sweep expired temp facts
 ```
 
 **Fact categories:** `personal`, `work`, `preference`, `hobby`, `relationship`, `goal`, `context`
+
+#### `mem.contradictions`
+
+```typescript
+// Persisted (async, written on supersession)
+const signals = await mem.contradictions.getUnsurfaced('user-123', sessionId);
+
+// Inline (real-time, zero-I/O)
+const inlines = mem.contradictions.detectInline(currentMessage, await mem.facts.get('user-123'));
+```
+
+#### `mem.quality`
+
+```typescript
+await mem.quality.scoreResponse({ messageId, userId, sessionId, mode, responseContent });
+await mem.quality.resolveFollowup({
+  userId, sessionId,
+  previousAssistantMessageId, previousAssistantCreatedAt,
+  nextUserContent, nextUserCreatedAt,
+});
+await mem.quality.runSelfCheck(8); // periodic
+const stats = await mem.quality.getStats('user-123', { since });
+```
+
+#### `mem.textures`
+
+```typescript
+await mem.textures.capture(sessionId, { mode: 'companion', speaker: 'user' });
+const prompt = await mem.textures.getForPrompt('user-123', { mode: 'companion', speaker: 'user' });
+const latest = await mem.textures.getLatest('user-123', { mode: 'companion', speaker: 'user' });
+```
+
+#### `mem.intentions`
+
+```typescript
+const id = await mem.intentions.save('user-123', 'Reach out to old mentor');
+const prompt = await mem.intentions.getPrompt('user-123', { timezone: 'Europe/Stockholm' });
+await mem.intentions.resolve('user-123', 'done');
+const open = await mem.intentions.listOpen('user-123');
+const all = await mem.intentions.listAll('user-123');
+```
 
 #### `mem.emotions`
 
 ```typescript
 const moments = await mem.emotions.getRecent('user-123', 7, 10); // last 7 days, max 10
-```
-
-#### `mem.contradictions`
-
-```typescript
-const signals = await mem.contradictions.getUnsurfaced('user-123');
 ```
 
 #### `mem.behavioral`
@@ -433,21 +622,6 @@ Not every fact value becomes a graph entity. The graph pipeline filters out:
 - Phrases longer than 6 words
 - Descriptive text that isn't a named entity
 
-### Example Graph Output
-
-```
-User → NAMED → Frida (name)
-User → WORKS_AT → White Arkitekter (organization)
-User → WORKS_AS → architect (role)
-User → LIVES_IN → Helsingborg (place)
-User → PREVIOUSLY_IN → Gothenburg (place)
-User → PARTNER_OF → Erik (person)
-User → PARENT_OF → Saga (person)
-User → COLLEAGUE_OF → Anders (person)
-Erik → HAS_ROLE → chef (role)
-Erik → RUNS → Salta restaurant (organization)
-```
-
 ## Consolidation
 
 Three-stage memory consolidation pipeline:
@@ -478,33 +652,52 @@ Runs at 3 AM Sundays by default:
 
 The SDK auto-creates all tables on `initialize()` via migrations. Tables are prefixed with `bwmem_` by default.
 
-**Core tables:**
+**Core (mig 001):**
 | Table | Purpose |
 |---|---|
 | `sessions` | Session tracking with active/ended state |
 | `messages` | Messages with pgvector embeddings and VAD sentiment |
-| `facts` | Structured facts with lifecycle (active/superseded/expired) |
+| `facts` | Structured facts with full bi-temporal lifecycle |
 | `conversation_summaries` | Auto-generated session summaries with embeddings |
 
-**Resonant memory:**
+**Resonant (mig 002):**
 | Table | Purpose |
 |---|---|
 | `emotional_moments` | High-emotion messages with descriptive tags |
 | `contradiction_signals` | Behavioral and factual contradictions |
 | `behavioral_observations` | Behavioral pattern observations |
 
-**Consolidation:**
+**Consolidation (mig 003):**
 | Table | Purpose |
 |---|---|
 | `consolidation_runs` | Audit log of all consolidation jobs |
 | `episodic_patterns` | Patterns extracted per session |
 | `semantic_knowledge` | Long-term aggregated knowledge |
 
-**API layer (v0.2.0):**
+**API layer (mig 004-006):**
 | Table | Purpose |
 |---|---|
 | `api_tenants` | Tenant accounts with API keys and tier limits |
 | `api_usage` | Per-tenant usage tracking |
+
+**Bi-temporal + audit (mig 007, v0.3.0):**
+| Column / Table | Purpose |
+|---|---|
+| `facts.recorded_at` | Transaction-time start (when we first wrote this row) |
+| `facts.superseded_at` | Transaction-time end (NULL while believed) |
+| `facts.intent_id` | Optional intent scope (same key, different values per conversation) |
+| `fact_corrections` | Append-only audit log of every supersession |
+
+**Quality scoring (mig 008, v0.3.0):**
+| Table | Purpose |
+|---|---|
+| `message_quality` | Per-response `output_integrity` + `interaction_vitality` |
+
+**Session texture + intentions (mig 009-010, v0.3.0):**
+| Table | Purpose |
+|---|---|
+| `session_textures` | Throughline + emotional register at session close |
+| `self_intentions` | Held things-to-do with daily surfacing and defer ceiling |
 
 ## Security (API layer)
 
@@ -529,42 +722,63 @@ Session.recordMessage()
     │
     ├──▶ Store message in PostgreSQL
     │
+    ├──▶ Inline contradiction scan (sync, zero-I/O)
+    │
     └──▶ Background processing (fire-and-forget)
            ├── Generate embedding → store with pgvector
            ├── Sentiment analysis (VAD) → store scores
-           ├── Fact extraction (every 3 msgs) → dedup → store facts
+           ├── Fact extraction → dedup (exact + semantic) → store facts
+           │     ├── Drop speaker / current_* / volatile keys
+           │     └── Stamp supersession audit row on belief change
            ├── LLM contradiction detection → flag conflicts
            ├── Emotional moment capture → descriptive tagging
            ├── Graph sync → entities + relationships → Neo4j
            └── Update session centroid
 
+assistant message saved
+    │
+    └──▶ quality.scoreResponse() — output_integrity floor (hedging, refusal,
+           relevance via embedding, coherence via contradiction count)
+
+next user message
+    │
+    └──▶ quality.resolveFollowup() — interaction_vitality (speed, length,
+           feedback class)
+
 Session.end()
     │
-    └──▶ Episodic consolidation (BullMQ job)
-           ├── Extract patterns (themes, moments, preferences)
-           └── Generate conversation summary with embedding
-
-buildContext()
+    ├──▶ Episodic consolidation (BullMQ job)
+    │     ├── Extract patterns
+    │     └── Generate conversation summary with embedding
     │
-    └──▶ Query 9 sources in parallel (5s timeout each)
-           ├── Facts
-           ├── Similar messages (pgvector)
-           ├── Similar conversations (pgvector)
-           ├── Emotional moments
-           ├── Contradictions
-           ├── Behavioral observations
-           ├── Episodic patterns
-           ├── Semantic knowledge
-           └── Graph context (Neo4j)
-           │
-           ▼
-         MemoryContext.formatted → inject into LLM system prompt
+    └──▶ textures.capture()  (caller-driven, fire-and-forget)
+          └── Distill throughline + emotional register → row per (mode, speaker)
+
+next session open
+    │
+    └──▶ buildContext()
+          └──▶ 11 sources in parallel (5s timeout each)
+                 ├── Facts (priority-aware, intent-aware)
+                 ├── Similar messages (pgvector)
+                 ├── Similar conversations (pgvector)
+                 ├── Emotional moments
+                 ├── Contradictions (per-fact_key dedup)
+                 ├── Behavioral observations
+                 ├── Episodic patterns
+                 ├── Semantic knowledge
+                 ├── Graph context (Neo4j)
+                 ├── Session texture (72h freshness taper)
+                 └── Intention prompt (opt-in; side-effect: defer bump)
+                 │
+                 ▼
+               MemoryContext.formatted → inject into LLM system prompt
 ```
 
 ## Testing
 
 ```bash
 npm test              # Unit tests (no external services needed)
+npm run typecheck     # TypeScript checks
 npm run build         # TypeScript compilation
 npm run start:api     # Start the REST API server
 ```

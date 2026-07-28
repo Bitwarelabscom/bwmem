@@ -31,6 +31,7 @@ export type {
   FactCategory,
   FactStatus,
   FactType,
+  SimilarFactMatch,
 
   // Sessions
   SessionConfig,
@@ -40,6 +41,7 @@ export type {
   // Emotional / Behavioral
   EmotionalMoment,
   ContradictionSignal,
+  InlineContradiction,
   BehavioralObservation,
   SentimentResult,
 
@@ -58,10 +60,27 @@ export type {
 
   // Summaries
   ConversationSummary,
+
+  // Quality scoring
+  QualityScore,
+  QualityStats,
+
+  // Session texture + self-intention
+  SessionTexture,
+  SelfIntention,
+  SelfIntentionStatus,
 } from './types.js';
 
 // Session class (for type usage)
 export type { Session } from './session/session.js';
+
+// Quality scorer input types
+export type { ScoreResponseInput, ResolveFollowupInput } from './memory/quality-scorer.service.js';
+export type { IntentionPromptOptions } from './memory/self-intention.service.js';
+
+// Fact key guards (exposed so callers writing their own save paths can
+// short-circuit volatile/structural keys the same way storeFact does).
+export { isSpeakerFact, isEphemeralFactKey, isVolatileFactKey } from './memory/facts.service.js';
 
 // Utilities
 export { formatRelativeTime } from './utils/time-utils.js';

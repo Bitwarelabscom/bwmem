@@ -31,7 +31,7 @@ export class OllamaProvider implements EmbeddingProvider, LLMProvider {
     const response = await fetch(`${this.baseUrl}/api/embed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: this.embeddingModel, input: text }),
+      body: JSON.stringify({ model: this.embeddingModel, input: text, keep_alive: '30m' }),
     });
 
     if (!response.ok) {
@@ -47,7 +47,7 @@ export class OllamaProvider implements EmbeddingProvider, LLMProvider {
     const response = await fetch(`${this.baseUrl}/api/embed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: this.embeddingModel, input: texts }),
+      body: JSON.stringify({ model: this.embeddingModel, input: texts, keep_alive: '30m' }),
     });
 
     if (!response.ok) {
@@ -63,6 +63,7 @@ export class OllamaProvider implements EmbeddingProvider, LLMProvider {
       model: this.model,
       messages,
       stream: false,
+      keep_alive: '30m',
       options: {
         temperature: options?.temperature ?? 0.7,
       },

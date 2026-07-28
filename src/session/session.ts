@@ -164,13 +164,14 @@ export class Session {
   }
 
   private async processMessageBackground(messageId: string, role: string, content: string): Promise<void> {
-    // Generate sentiment
-    const sentimentResult = await this.sentiment.analyze(content);
+    // Store the embedding FIRST (fast, recall-critical) so memory is queryable
+    // within ~300ms — not gated behind the slow LLM sentiment call below.
+    await this.embedding.storeMessageEmbedding(messageId, this.userId, this.id, content, role);
 
-    // Store embedding + sentiment
-    await this.embedding.storeMessageEmbedding(
-      messageId, this.userId, this.id, content, role,
-      sentimentResult.valence, sentimentResult.arousal, sentimentResult.dominance,
+    // Sentiment (LLM) runs after the embedding is already queryable; update the row.
+    const sentimentResult = await this.sentiment.analyze(content);
+    await this.embedding.updateMessageSentiment(
+      messageId, sentimentResult.valence, sentimentResult.arousal, sentimentResult.dominance,
     );
 
     // Update session centroid

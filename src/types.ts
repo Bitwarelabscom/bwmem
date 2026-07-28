@@ -120,11 +120,17 @@ export interface Fact {
   factType: FactType;
   validFrom?: Date;
   validUntil?: Date;
+  /** Transaction-time start: when we first wrote this row. */
+  recordedAt?: Date;
+  /** Transaction-time end: when we stopped believing this row (NULL while believed). */
+  supersededAt?: Date;
   supersedesId?: string;
   overridePriority: number;
   mentionCount: number;
   lastMentioned?: Date;
   sourceSessionId?: string;
+  /** Optional scope: same fact key can hold different values across intents. */
+  intentId?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -139,6 +145,25 @@ export interface StoreFact {
   validFrom?: Date;
   validUntil?: Date;
   sessionId?: string;
+  /** Optional intent scope (see Fact.intentId). */
+  intentId?: string | null;
+  /** Set true to mark this as an explicit user correction (vs misremember). */
+  isCorrection?: boolean;
+}
+
+/**
+ * Result of {@link FactsService.findSimilarActiveFact}. Returned when an
+ * embedding-based similarity scan finds an existing active fact with the same
+ * meaning under a different key/wording — lets the caller collapse the new
+ * write onto the existing row via {@link FactsService.touchFactMention}
+ * instead of creating a near-duplicate.
+ */
+export interface SimilarFactMatch {
+  id: string;
+  category: string;
+  factKey: string;
+  factValue: string;
+  score: number;
 }
 
 export interface ExtractedFact {
@@ -201,6 +226,19 @@ export interface ContradictionSignal {
   surfaced: boolean;
   surfacedSessionIds: string[];
   createdAt: Date;
+}
+
+/**
+ * Result of {@link ContradictionService.detectInline} — a real-time, zero-I/O
+ * scan that fires when the current user message names a concept token for a
+ * well-established fact but uses a different value than what's stored. Lighter
+ * than `ContradictionSignal` because no DB row is written.
+ */
+export interface InlineContradiction {
+  factKey: string;
+  factCategory: string;
+  storedValue: string;
+  suspectedValue: string;
 }
 
 export interface BehavioralObservation {
@@ -285,6 +323,10 @@ export interface MemoryContext {
   episodicPatterns: EpisodicPattern[];
   semanticKnowledge: SemanticEntry[];
   graphContext?: string;
+  /** Anchor block for the next session in the same (mode, speaker) pair. */
+  sessionTexture?: string;
+  /** Oldest open intention, gated to once a day in `options.timezone`. */
+  intentionPrompt?: string;
   formatted: string;
   sourcesResponded: string;
 }
@@ -297,6 +339,14 @@ export interface BuildContextOptions {
   maxEmotionalMoments?: number;
   similarityThreshold?: number;
   timeoutMs?: number;
+  /** Selector for the session-texture source (default: 'default' / 'user'). */
+  mode?: string;
+  speaker?: string;
+  /** IANA timezone for the self-intention daily gate (default: UTC). */
+  timezone?: string;
+  /** Pass false to skip the bi-temporal "as of" sources (rarely needed). */
+  includeSessionTexture?: boolean;
+  includeIntentionPrompt?: boolean;
 }
 
 // ---- Graph ----
@@ -335,4 +385,82 @@ export interface ConversationSummary {
   messageCount: number;
   createdAt: Date;
   updatedAt: Date;
+}
+
+// ---- Quality Scoring ----
+
+/**
+ * Per-response quality record. Two honest numbers instead of one composite:
+ *
+ *  - `outputIntegrity` — the agent's own quality (relevance, coherence,
+ *    memory_fidelity, generativity, completeness_honesty). Reply latency
+ *    never touches this.
+ *  - `interactionVitality` — engagement signal (mostly the user's): reply
+ *    speed, reply length, feedback class. Real signal, but not a quality
+ *    score the agent should self-criticize over.
+ *
+ * `compositeScore` is kept for back-compat and mirrors `outputIntegrity`.
+ */
+export interface QualityScore {
+  messageId: string;
+  userId: string;
+  sessionId: string;
+  mode?: string;
+  scoredAt: Date;
+  followupResolvedAt?: Date;
+  scores: Record<string, unknown>;
+  outputIntegrity?: number;
+  interactionVitality?: number;
+  compositeScore?: number;
+  selfCheckAt?: Date;
+  explicitFeedback?: string;
+}
+
+export interface QualityStats {
+  total: number;
+  averageOutputIntegrity: number | null;
+  averageInteractionVitality: number | null;
+  averageComposite: number | null;
+  averageHedgingDensity: number | null;
+  refusalRate: number;
+  selfCheckedCount: number;
+  feedbackBreakdown: Record<string, number>;
+  recentLowQuality: Array<{
+    messageId: string;
+    sessionId: string;
+    scoredAt: Date;
+    outputIntegrity: number | null;
+    explicitFeedback: string | null;
+  }>;
+}
+
+// ---- Session Texture ----
+
+export interface SessionTexture {
+  id: string;
+  userId: string;
+  sessionId?: string;
+  mode: string;
+  speaker: string;
+  throughline: string;
+  emotionalRegister: string;
+  createdAt: Date;
+}
+
+// ---- Self-Intention ----
+
+export type SelfIntentionStatus = 'open' | 'done' | 'let_go';
+
+export interface SelfIntention {
+  id: string;
+  userId: string;
+  intention: string;
+  note: string | null;
+  status: SelfIntentionStatus;
+  deferCount: number;
+  firstSurfacedAt: Date | null;
+  lastSurfacedAt: Date | null;
+  resolvedAt: Date | null;
+  resolution: string | null;
+  createdAt: Date;
 }

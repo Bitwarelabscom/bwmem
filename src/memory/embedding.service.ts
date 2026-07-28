@@ -145,6 +145,18 @@ export class EmbeddingService {
     }
   }
 
+  /** Update only the sentiment columns (used when sentiment is computed after the embedding is already stored). */
+  async updateMessageSentiment(messageId: string, valence: number, arousal: number, dominance: number): Promise<void> {
+    try {
+      await this.pg.query(
+        `UPDATE ${this.prefix}messages SET sentiment_valence = $2, sentiment_arousal = $3, sentiment_dominance = $4 WHERE id = $1`,
+        [messageId, valence, arousal, dominance]
+      );
+    } catch (error) {
+      this.logger.debug('Failed to update message sentiment', { error: (error as Error).message, messageId });
+    }
+  }
+
   /** Search for semantically similar messages. */
   async searchSimilarMessages(
     userId: string, query: string, limit = 5, threshold = 0.25,

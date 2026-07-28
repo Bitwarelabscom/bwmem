@@ -16,9 +16,11 @@ describe('ContradictionService', () => {
       pg.willReturnOne(null); // no existing signal
       pg.willReturn([]);      // INSERT
 
+      // Use a stable fact key — volatile keys (location, schedule, _time, …)
+      // are silently skipped by createSignal to keep the signal feed clean.
       await service.createSignal(
-        'user-1', 'session-1', 'location',
-        'New York', 'San Francisco',
+        'user-1', 'session-1', 'partner_name',
+        'Alice', 'Beth',
         'correction',
       );
 
@@ -30,13 +32,64 @@ describe('ContradictionService', () => {
       pg.willReturnOne({ id: 'existing-1' }); // Already exists
 
       await service.createSignal(
-        'user-1', 'session-1', 'location',
-        'New York', 'San Francisco',
+        'user-1', 'session-1', 'partner_name',
+        'Alice', 'Beth',
         'correction',
       );
 
       // Only the SELECT query, no INSERT
       expect(pg.queries).toHaveLength(1);
+    });
+
+    it('drops volatile-key signals before the SELECT', async () => {
+      // location is volatile — should short-circuit with zero queries.
+      await service.createSignal(
+        'user-1', 'session-1', 'location',
+        'New York', 'San Francisco',
+        'correction',
+      );
+      expect(pg.queries).toHaveLength(0);
+    });
+  });
+
+  describe('detectInline', () => {
+    it('returns empty for messages with no capitalized non-stopwords', () => {
+      const result = service.detectInline('i live in new york', []);
+      expect(result).toEqual([]);
+    });
+
+    it('flags a contradiction when a concept token + different value appears', () => {
+      // partner_name has the concept token "wife"; stored Alice, message says Beth.
+      const result = service.detectInline('My wife Beth is great', [{
+        id: 'f1', userId: 'u', category: 'relationship', factKey: 'partner_name',
+        factValue: 'Alice', confidence: 1, factStatus: 'active', factType: 'permanent',
+        overridePriority: 0, mentionCount: 3,
+        createdAt: new Date(), updatedAt: new Date(),
+      }]);
+      expect(result).toHaveLength(1);
+      expect(result[0].factKey).toBe('partner_name');
+      expect(result[0].suspectedValue).toBe('Beth');
+    });
+
+    it('skips facts on volatile keys', () => {
+      const result = service.detectInline('I live in Berlin', [{
+        id: 'f1', userId: 'u', category: 'personal', factKey: 'location',
+        factValue: 'Tokyo', confidence: 1, factStatus: 'active', factType: 'permanent',
+        overridePriority: 0, mentionCount: 5,
+        createdAt: new Date(), updatedAt: new Date(),
+      }]);
+      // location is volatile — never a contradiction.
+      expect(result).toEqual([]);
+    });
+
+    it('skips low-mentionCount facts without semantic mapping', () => {
+      const result = service.detectInline('My nickname Hank is good', [{
+        id: 'f1', userId: 'u', category: 'personal', factKey: 'unmapped_key',
+        factValue: 'Henrik', confidence: 1, factStatus: 'active', factType: 'permanent',
+        overridePriority: 0, mentionCount: 1,
+        createdAt: new Date(), updatedAt: new Date(),
+      }]);
+      expect(result).toEqual([]);
     });
   });
 
