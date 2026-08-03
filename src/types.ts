@@ -33,6 +33,32 @@ export interface BwMemConfig {
   session?: SessionOptions;
   tablePrefix?: string;
   logger?: Logger;
+
+  /**
+   * Close the KEY axis of the duplicate-fact problem: when an extractor mints a
+   * new fact_key for a claim already stored, adjudicate whether the two are the
+   * same claim and merge instead of filing a parallel row. Costs an embed batch
+   * plus up to three LLM calls on a write that creates a new key; fails open to
+   * a plain insert on every failure mode. Default true.
+   */
+  factKeyMerge?: boolean;
+
+  /**
+   * Enable the synchronous inline contradiction scan. OFF by default: it is a
+   * heuristic over capitalized words with no model behind it, and before the
+   * proximity rule and cap it emitted 35 phantom contradictions on one message.
+   */
+  inlineContradictions?: boolean;
+
+  /**
+   * Extract a (subject, predicate, occurred_on) timeline at consolidation time,
+   * so ordering and elapsed-time questions become a SORT rather than a vector
+   * search. Costs one LLM call per consolidated session over the whole
+   * transcript — far more token-hungry than per-message extraction, so it is
+   * OFF by default and deserves its own budget. Measured +11.4pp on that
+   * question class.
+   */
+  temporalIndex?: boolean;
 }
 
 export interface PostgresConfig {

@@ -24,6 +24,10 @@ import { EmbeddingService } from './memory/embedding.service.js';
 import { SentimentService } from './memory/sentiment.service.js';
 import { CentroidService } from './memory/centroid.service.js';
 import { EmotionalMomentsService } from './memory/emotional-moments.service.js';
+import { TemporalEventsService } from './memory/temporal-events.service.js';
+import { FactMergeGate } from './memory/fact-merge-gate.service.js';
+import { FactKeyMerge } from './memory/fact-key-merge.service.js';
+import { ParaphraseGate } from './memory/paraphrase-gate.service.js';
 import { ContradictionService } from './memory/contradiction.service.js';
 import { BehavioralService } from './memory/behavioral.service.js';
 import { SummariesService } from './memory/summaries.service.js';
@@ -47,6 +51,7 @@ interface Services {
   contradictions: ContradictionService;
   behavioral: BehavioralService;
   summaries: SummariesService;
+  temporalEvents: TemporalEventsService;
   qualityScorer: QualityScorerService;
   sessionTexture: SessionTextureService;
   selfIntention: SelfIntentionService;
@@ -89,12 +94,29 @@ export class BwMem {
     const embedding = new EmbeddingService(pg, this.config.embeddings, prefix, logger);
     const sentiment = new SentimentService(this.config.llm, logger);
     const centroid = new CentroidService(redis, logger);
+    // The DeMem gate is shared: one definition of "same claim" must govern both
+    // the key axis (fact-key merge) and the value axis (contradiction signals).
+    // Two independent notions of sameness disagree, and the disagreement shows
+    // up as facts that merge but still file a contradiction against themselves.
+    const mergeGate = new FactMergeGate(this.config.llm, logger);
+    const keyMerge = new FactKeyMerge(
+      pg, prefix, this.config.embeddings, mergeGate, logger,
+      this.config.factKeyMerge,
+    );
+
     const facts = new FactsService(
       pg, this.config.llm, this.config.graph ?? null,
-      prefix, logger, this.config.embeddings,
+      prefix, logger, this.config.embeddings, keyMerge,
+    );
+    const temporalEvents = new TemporalEventsService(
+      pg, prefix, this.config.llm, this.config.embeddings, logger,
+      this.config.temporalIndex,
     );
     const emotionalMoments = new EmotionalMomentsService(pg, this.config.llm, prefix, logger);
-    const contradictions = new ContradictionService(pg, prefix, logger);
+    const contradictions = new ContradictionService(
+      pg, prefix, logger, this.config.inlineContradictions,
+      new ParaphraseGate(this.config.embeddings, mergeGate, logger),
+    );
     const behavioral = new BehavioralService(pg, prefix, logger);
     const summaries = new SummariesService(pg, this.config.llm, embedding, prefix, logger);
     const qualityScorer = new QualityScorerService(pg, this.config.llm, this.config.embeddings, prefix, logger);
@@ -126,7 +148,7 @@ export class BwMem {
 
     this.services = {
       pg, redis, facts, embedding, sentiment, centroid,
-      emotionalMoments, contradictions, behavioral, summaries,
+      emotionalMoments, contradictions, behavioral, summaries, temporalEvents,
       qualityScorer, sessionTexture, selfIntention,
       contextBuilder, sessionManager, scheduler,
     };

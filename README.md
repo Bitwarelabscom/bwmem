@@ -4,7 +4,7 @@ Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: bi-tempo
 
 Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, response quality scoring, and long-term memory consolidation in the background.
 
-**v0.3.0** adds bi-temporal facts, embedding-based semantic dedup, inline contradiction detection, response quality scoring (output integrity vs interaction vitality), session-texture carryover, and held self-intentions.
+**v0.5.0** adds same-claim merge gates on both the key and value axes, contradiction signals that count the disagreement rather than the mentions, a timeline index for ordering questions, and a per-channel session texture. It also fixes two defects in earlier releases: a dedup scope that produced duplicate active facts, and an inline contradiction scan that over-fired.
 
 ## Features
 
@@ -21,6 +21,8 @@ Drop it into any chatbot — record messages, build context, inject into your LL
 - **Memory consolidation** — episodic (per-session), daily, and weekly consolidation pipelines
 - **Conversation summaries** — auto-generated summaries with topic extraction
 - **Context builder** — aggregates 11 memory sources into a single formatted prompt injection
+- **Same-claim gates** — decision-compatibility adjudication on the key and value axes (0.5.0)
+- **Timeline index** — ordering and elapsed-time questions become a sort, not a search (0.5.0)
 - **Knowledge graph** — Neo4j integration with schema-constrained entity relationships (27 types), entity-to-entity edges, and entity-scoped subgraphs
 - **Provider-agnostic** — works with OpenAI, Ollama, OpenRouter, or any custom provider
 - **REST API** — Fastify-based multi-tenant API with API key auth, rate limiting, usage tracking, and Swagger docs
@@ -78,6 +80,92 @@ await mem.textures.capture(session.id); // anchor for the next session
 await mem.shutdown();
 ```
 
+## What's new in 0.5.0
+
+### Two bugs from earlier releases
+
+**Duplicate active facts.** `storeFact` scoped its dedup lookup to
+`(user_id, category, fact_key, intent_id, fact_type)`. Any of those changing
+between two mentions of the same claim missed the lookup and inserted a parallel
+"currently believed" row. Measured on a production install: **51% of active rows
+were duplicates**, with one key holding 25 concurrent values. Identity is now
+`(user_id, fact_key)` alone, enforced by a partial unique index. Migration 011
+collapses existing duplicates — it supersedes rather than deletes, so the
+bi-temporal history survives.
+
+**`detectInline` over-fired.** It paired every concept-matching fact with the
+first capitalized word anywhere in the message: no proximity rule, no cap, no
+dedup. One message produced **35 phantom contradictions**. It now requires the
+candidate to sit within a clause of the concept token, emits at most three, never
+repeats a key — and is **opt-in**, because it remains a heuristic with no model
+behind it:
+
+```typescript
+const mem = new BwMem({ ..., inlineContradictions: true });
+```
+
+### Same-claim merge gates
+
+Cosine similarity cannot decide whether two statements are the same claim.
+Measured on a 1024-dim embedder: a paraphrase pair scored **0.80**, while a
+negation ("likes the quiet" / "is afraid of the quiet") scored **0.85** and a
+value swap scored **0.87**. Real contradictions sit *above* paraphrases —
+embeddings are negation-blind, so no threshold separates them.
+
+So cosine only prunes, and an LLM gate decides, using decision-compatibility
+(DeMem, arXiv 2605.10870): two statements may share a fact slot iff treating them
+as one could never change what the assistant should do or say.
+
+One gate governs both axes:
+
+- **value axis** — is this supersession real drift, or the same thing reworded?
+  Stops the contradiction counter climbing on a stable memory.
+- **key axis** — has the extractor minted a *new key* for a claim already held?
+  (`learning_style_visual`, then `visual_learning`, then …) Measured: 129 active
+  keys sharing one prefix in a single day.
+
+Both fail **open**: embedder down, LLM down, timeout, unparseable — the write
+proceeds as it did before. A duplicate row is recoverable; a dropped fact is not.
+
+```typescript
+const mem = new BwMem({ ..., factKeyMerge: true });  // default
+```
+
+### Contradiction signals carry provenance
+
+One open row per `(user, fact_key, stored_value)`; a repeat bumps `repeat_count`
+instead of filing a new alarm. `created_at` stays the **first** sighting, so
+"this has been wrong since Tuesday" remains answerable.
+
+Each signal records *why* it fired — `gate_path`, `gate_similarity`,
+`gate_reason`. "The model judged these separate" and "the model never answered in
+time" both let a signal through, and only one is evidence about memory.
+
+### Timeline index for ordering questions
+
+Semantic search structurally cannot answer *"who did I meet first, Mark and Sarah
+or Tom?"* — one query embedding cannot sit near three events at once, and
+decomposing into per-entity searches measures **worse** (narrow sub-queries fall
+under the similarity floor).
+
+Extracting `(subject, predicate, occurred_on)` at consolidation makes those
+questions an `ORDER BY`. Measured **+11.4pp** on that question class.
+
+The load-bearing rule: `occurred_on` is when the event **happened**, resolved
+against the conversation date — not when it was mentioned. Conflating them
+reduces the index to "sort by when we talked about it".
+
+```typescript
+const mem = new BwMem({ ..., temporalIndex: true });  // off by default: one LLM call per session
+```
+
+### Session texture is per channel
+
+How a conversation felt over voice does not carry to text. `channel` is now part
+of the relationship key, and the write is a single upsert — the old
+DELETE-then-INSERT was not atomic, so a concurrent read between them saw no
+texture at all and opened the next session cold.
+
 ## What's new in 0.3.0
 
 ### Bi-temporal facts
@@ -123,15 +211,19 @@ isVolatileFactKey('work_schedule')     // true — store but no contradiction si
 
 ### Inline contradiction detection
 
-A pure-synchronous, zero-I/O scan runs during message ingestion:
+A pure-synchronous, zero-I/O scan during message ingestion. **Opt-in since
+0.5.0** — see the 0.5.0 notes for why.
 
 ```typescript
+const mem = new BwMem({ ..., inlineContradictions: true });
 const facts = await mem.facts.get('user-123');
 const inlines = mem.contradictions.detectInline(message.content, facts);
 // inlines[0] = { factKey: 'partner_name', storedValue: 'Alice', suspectedValue: 'Beth' }
 ```
 
-Stopword filter excludes sentence-initial words ("I", "My", "The", "Hey", …) and the scan skips volatile keys.
+A stopword filter excludes sentence-initial words ("I", "My", "The", "Hey", …),
+volatile keys are skipped, the candidate must sit within a clause of the concept
+token, and at most three are returned.
 
 ### Quality scoring
 
@@ -195,7 +287,7 @@ const open = await mem.intentions.listOpen('user-123');
 
 ## REST API
 
-v0.3.0 retains the multi-tenant REST API layer.
+v0.5.0 retains the multi-tenant REST API layer.
 
 ### Running the API
 
@@ -692,6 +784,15 @@ The SDK auto-creates all tables on `initialize()` via migrations. Tables are pre
 | Table | Purpose |
 |---|---|
 | `message_quality` | Per-response `output_integrity` + `interaction_vitality` |
+
+**Fact dedup, contradiction provenance, texture channel, timeline (migs 011-014, v0.5.0):**
+
+| Migration | What it does |
+|---|---|
+| `011_fact_dedup` | collapses duplicate active facts; `(user_id, fact_key)` unique-active index |
+| `012_contradiction_dedup` | `repeat_count` / `last_seen_at`; gate verdict columns; open-signal dedup index |
+| `013_session_texture_channel` | adds `channel` to the relationship key |
+| `014_temporal_events` | the timeline index |
 
 **Session texture + intentions (mig 009-010, v0.3.0):**
 | Table | Purpose |

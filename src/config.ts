@@ -27,6 +27,12 @@ export interface ResolvedConfig {
   session: {
     inactivityTimeoutMs: number;
   };
+  /** Key-axis same-claim merge on storeFact. See BwMemConfig.factKeyMerge. */
+  factKeyMerge: boolean;
+  /** Synchronous inline contradiction scan. Off unless asked for. */
+  inlineContradictions: boolean;
+  /** Timeline extraction at consolidation. Off unless asked for. */
+  temporalIndex: boolean;
   logger: Logger;
 }
 
@@ -70,6 +76,9 @@ export function resolveConfig(input: BwMemConfig): ResolvedConfig {
       daily: input.consolidation?.daily ?? DEFAULT_DAILY_CRON,
       weekly: input.consolidation?.weekly ?? DEFAULT_WEEKLY_CRON,
     },
+    factKeyMerge: input.factKeyMerge !== false,
+    inlineContradictions: input.inlineContradictions === true,
+    temporalIndex: input.temporalIndex === true,
     session: {
       inactivityTimeoutMs: input.session?.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS,
     },

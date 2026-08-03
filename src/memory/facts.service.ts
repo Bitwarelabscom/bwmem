@@ -5,6 +5,7 @@ import type {
 } from '../types.js';
 import { formatRelativeTime } from '../utils/time-utils.js';
 import { globalStats } from '../stats.js';
+import type { FactKeyMerge } from './fact-key-merge.service.js';
 
 /** Normalize a fact key for dedup comparison: lowercase, strip underscores/hyphens, trim common prefixes. */
 function normalizeKey(key: string): string {
@@ -81,6 +82,46 @@ export function isVolatileFactKey(key: string): boolean {
   return isEphemeralFactKey(key) || VOLATILE_FACT_KEY_PATTERN.test(key);
 }
 
+// Some keys hold a SET, not a single value: allergies, languages, pets. A new
+// member is an addition, not a correction, so the supersede path is wrong for
+// them — and so is the key-axis merge, since two set-valued keys holding
+// different members are not the same claim.
+const SET_VALUED_FACT_KEY_PATTERN =
+  /(allerg|languages?|pets?|siblings?|children|skills?|instruments?|dietary|medications?)/i;
+
+/** True if the key holds a set whose members accumulate rather than replace. */
+export function isSetValuedFactKey(key: string): boolean {
+  return SET_VALUED_FACT_KEY_PATTERN.test(key);
+}
+
+const SET_VALUE_SEPARATOR = '; ';
+
+/** Split a set-valued fact's stored value into its members. */
+export function splitSetValue(value: string): string[] {
+  return value
+    .split(/;|,(?![^(]*\))/)
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Merge a new member into a set-valued fact, preserving order and dropping
+ * case-insensitive duplicates. Returns null when nothing changed, so the caller
+ * can skip a write that would only bump a timestamp.
+ */
+export function mergeSetValue(stored: string, incoming: string): string | null {
+  const members = splitSetValue(stored);
+  const seen = new Set(members.map((m) => m.toLowerCase()));
+  const added = splitSetValue(incoming).filter((m) => !seen.has(m.toLowerCase()));
+  if (added.length === 0) return null;
+  return [...members, ...added].join(SET_VALUE_SEPARATOR);
+}
+
+/** True if this key may be a target of the key-axis same-claim merge. */
+export function isMergeableFactKey(key: string): boolean {
+  return !isVolatileFactKey(key) && !isSetValuedFactKey(key) && !isSpeakerFact(key);
+}
+
 function mapRowToFact(row: Record<string, unknown>): Fact {
   return {
     id: row.id as string,
@@ -121,6 +162,13 @@ export class FactsService {
   private graph: GraphPlugin | null;
   private prefix: string;
   private logger: Logger;
+  /**
+   * Optional: closes the KEY axis of the duplicate-fact bug. Migration 011 fixed
+   * the category axis (identity scoped too wide); this catches the case where an
+   * extractor mints a NEW key for a claim already held. Absent = plain insert,
+   * which is the behaviour before 0.5.0.
+   */
+  private keyMerge: FactKeyMerge | null;
 
   constructor(
     pg: PgClient,
@@ -129,6 +177,7 @@ export class FactsService {
     prefix: string,
     logger: Logger,
     embeddings: EmbeddingProvider | null = null,
+    keyMerge: FactKeyMerge | null = null,
   ) {
     this.pg = pg;
     this.llm = llm;
@@ -136,6 +185,7 @@ export class FactsService {
     this.graph = graph;
     this.prefix = prefix;
     this.logger = logger;
+    this.keyMerge = keyMerge;
   }
 
   /** Get active facts for a user with priority-aware deduplication. */
@@ -258,20 +308,56 @@ export class FactsService {
       }
     }
 
+    // Key-axis merge, BEFORE the transaction: it makes network calls (embed +
+    // LLM) and must never hold a row lock while it waits. Returns null on every
+    // failure mode, in which case this is a plain insert exactly as before.
+    let effectiveKey = key;
+    if (this.keyMerge && isMergeableFactKey(key)) {
+      const match = await this.keyMerge.findSameClaimActiveFact(
+        userId,
+        { factKey: key, factValue: value },
+        { excludeKey: (k: string) => !isMergeableFactKey(k) },
+      );
+      if (match) {
+        // Rewrite onto the matched row's key and fall into the normal
+        // supersede/bump branches below. Bi-temporal supersession and the
+        // unique-active invariant are untouched.
+        this.logger.debug('fact key merge: same claim under a different key', {
+          from: key, to: match.factKey, similarity: match.similarity, reason: match.reason,
+        });
+        effectiveKey = match.factKey;
+      }
+    }
+
     return this.pg.transaction(async (client) => {
-      // 1. Find existing active fact with same key (within this intent scope)
+      // Serialise check-then-act per (user, key). Without it two concurrent
+      // writes of the same key both see "no existing row" and both insert,
+      // which the unique-active index then rejects — one of them losing a fact
+      // that was never in conflict. Transaction-scoped, so it releases on
+      // COMMIT or ROLLBACK with no unlock path to forget.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
+        userId, effectiveKey,
+      ]);
+
+      // 1. Find the existing active fact for this key.
+      //
+      // Scoped to (user_id, fact_key) ONLY — deliberately not category,
+      // intent_id or fact_type. Those are an extractor's opinion about a claim,
+      // not part of its identity, and scoping identity by them means a
+      // re-classified extraction becomes a second truth rather than a
+      // correction. Measured before migration 011: 51% of active rows were
+      // duplicates, one key holding 25 concurrent values. Do not re-widen.
       const existingResult = await client.query<{
         id: string; fact_value: string; mention_count: number;
         fact_type: string; fact_status: string;
       }>(
         `SELECT id, fact_value, mention_count, fact_type, fact_status
          FROM ${this.prefix}facts
-         WHERE user_id = $1 AND category = $2 AND fact_key = $3
-           AND (intent_id = $4 OR (intent_id IS NULL AND $4 IS NULL))
+         WHERE user_id = $1 AND fact_key = $2
            AND fact_status = 'active'
          ORDER BY override_priority DESC, mention_count DESC
          LIMIT 1`,
-        [userId, category, key, intentId ?? null]
+        [userId, effectiveKey]
       );
       const existing = existingResult.rows[0];
 
@@ -284,7 +370,7 @@ export class FactsService {
              fact_status, fact_type, valid_from, valid_until, override_priority)
            VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11)
            RETURNING *`,
-          [userId, category, key, value, confidence, sessionId ?? null, intentId ?? null,
+          [userId, category, effectiveKey, value, confidence, sessionId ?? null, intentId ?? null,
            factType, validFrom ?? null, validUntil ?? null, priority]
         );
         const fact = mapRowToFact(result.rows[0]);
@@ -333,7 +419,7 @@ export class FactsService {
            fact_status, fact_type, valid_from, valid_until, supersedes_id, override_priority, mention_count)
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8, $9, $10, $11, $12, $13)
          RETURNING *`,
-        [userId, category, key, value, confidence, sessionId ?? null, intentId ?? null,
+        [userId, category, effectiveKey, value, confidence, sessionId ?? null, intentId ?? null,
          factType, validFrom ?? null, validUntil ?? null, existing.id, priority, inheritedMentionCount]
       );
       const fact = mapRowToFact(result.rows[0]);
@@ -343,7 +429,7 @@ export class FactsService {
         `INSERT INTO ${this.prefix}fact_corrections
           (user_id, fact_key, old_value, new_value, correction_type, reason)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [userId, key, existing.fact_value, value,
+        [userId, effectiveKey, existing.fact_value, value,
          factType === 'temporary' ? 'temporary_override' : 'correction',
          factType === 'temporary' ? 'Temporary override' : 'Value correction']
       );

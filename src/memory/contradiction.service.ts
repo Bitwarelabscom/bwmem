@@ -2,6 +2,7 @@ import type { PgClient } from '../db/postgres.js';
 import type { Logger, ContradictionSignal, InlineContradiction, Fact } from '../types.js';
 import { getConceptTokens, getSemantics } from './fact-semantics.js';
 import { isVolatileFactKey } from './facts.service.js';
+import type { ParaphraseGate } from './paraphrase-gate.service.js';
 
 /**
  * Common words that start with uppercase but aren't entity names. Used to
@@ -23,15 +24,110 @@ const INLINE_STOPWORDS = new Set([
 
 const INLINE_RELEVANT_CATEGORIES = new Set(['relationship', 'personal', 'context']);
 
+/** Past a handful this is an interrogation, not a memory check. */
+const MAX_INLINE_CONTRADICTIONS = 3;
+
+/**
+ * How far a candidate value may sit from the concept token it supposedly
+ * contradicts. Roughly one clause — beyond that the two are beside each other
+ * by coincidence.
+ */
+const INLINE_PROXIMITY_WORDS = 8;
+
 export class ContradictionService {
   private pg: PgClient;
   private prefix: string;
   private logger: Logger;
 
-  constructor(pg: PgClient, prefix: string, logger: Logger) {
+  /**
+   * Inline detection is OPT-IN and defaults OFF.
+   *
+   * It is a heuristic over capitalized words with no model behind it, and its
+   * failure mode is loud: it produced 35 phantom contradictions on a single
+   * message before the cap and proximity rule below. Even fixed it is a
+   * best-effort hint, so a consumer has to ask for it deliberately rather than
+   * inherit it from a default.
+   */
+  private inlineEnabled: boolean;
+
+  /**
+   * Decides whether a supersession is real drift or the same claim reworded.
+   * Optional: absent, every supersession files a signal, which is 0.3.0
+   * behaviour and the reason the counter climbed on a stable memory.
+   */
+  private paraphraseGate: ParaphraseGate | null;
+
+  constructor(
+    pg: PgClient, prefix: string, logger: Logger,
+    inlineEnabled = false,
+    paraphraseGate: ParaphraseGate | null = null,
+  ) {
     this.pg = pg;
     this.prefix = prefix;
     this.logger = logger;
+    this.inlineEnabled = inlineEnabled;
+    this.paraphraseGate = paraphraseGate;
+  }
+
+  /**
+   * File a misremember signal unless the two values are the same claim reworded.
+   *
+   * This is the entry point the fact path should use. Without the gate every
+   * rewording files a contradiction, and any consumer reading the count as a
+   * rate reports drifting recall over a memory that never moved.
+   */
+  async createMisrememberSignal(
+    userId: string, sessionId: string | undefined, factKey: string,
+    userStated: string, storedValue: string,
+  ): Promise<{ filed: boolean; path: string }> {
+    if (!this.paraphraseGate) {
+      await this.createSignal(userId, sessionId, factKey, userStated, storedValue, 'misremember');
+      return { filed: true, path: 'no_gate' };
+    }
+
+    const verdict = await this.paraphraseGate.isSemanticParaphrase(factKey, userStated, storedValue);
+    if (verdict.paraphrase) {
+      this.logger.debug('contradiction suppressed as paraphrase', {
+        factKey, path: verdict.path, similarity: verdict.similarity,
+      });
+      return { filed: false, path: verdict.path };
+    }
+
+    await this.createSignal(
+      userId, sessionId, factKey, userStated, storedValue, 'misremember',
+      { path: verdict.path, similarity: verdict.similarity, reason: verdict.reason },
+    );
+    return { filed: true, path: verdict.path };
+  }
+
+  /**
+   * The capitalized word closest to a concept token for this fact, or null.
+   *
+   * "Closest" is the whole point: a message can name several proper nouns, and
+   * pairing a fact with an unrelated one two clauses away is how the detector
+   * invented contradictions the user never implied.
+   */
+  private nearestCandidate(
+    messageWords: string[],
+    candidates: string[],
+    conceptTokens: string[],
+  ): string | null {
+    const conceptAt = messageWords.findIndex((w) =>
+      conceptTokens.some((t) => w.includes(t.toLowerCase())));
+    if (conceptAt === -1) return null;
+
+    let best: string | null = null;
+    let bestDistance = Infinity;
+    for (const candidate of candidates) {
+      const at = messageWords.findIndex((w) => w.includes(candidate.toLowerCase()));
+      if (at === -1) continue;
+      const distance = Math.abs(at - conceptAt);
+      if (distance <= INLINE_PROXIMITY_WORDS && distance < bestDistance) {
+        best = candidate;
+        bestDistance = distance;
+      }
+    }
+    return best;
   }
 
   /**
@@ -44,31 +140,52 @@ export class ContradictionService {
     userId: string, sessionId: string | undefined, factKey: string,
     userStated: string, storedValue: string,
     signalType: 'correction' | 'misremember',
+    gate?: { path: string; similarity?: number; reason?: string },
   ): Promise<void> {
     if (isVolatileFactKey(factKey)) {
       this.logger.debug('Skipped contradiction signal on volatile key', { factKey });
       return;
     }
     try {
-      const existing = await this.pg.queryOne<{ id: string }>(
-        `SELECT id FROM ${this.prefix}contradiction_signals
-         WHERE user_id = $1 AND fact_key = $2 AND session_id = $3`,
-        [userId, factKey, sessionId ?? null]
-      );
-
-      if (existing) {
-        this.logger.debug('Contradiction signal already exists', { factKey, sessionId });
-        return;
-      }
-
+      // Upsert on (user_id, fact_key, md5(stored_value)) WHERE surfaced = FALSE.
+      //
+      // The old guard was per-SESSION, which only suppressed repeats inside one
+      // conversation — the case that matters least. Across sessions, one stale
+      // fact that came up eight times became eight rows, and anything reading
+      // the count as a rate reported "recall is drifting" when exactly one fact
+      // was out of date.
+      //
+      // created_at is deliberately NOT touched on conflict: it is the FIRST
+      // sighting, and "this has been wrong since Tuesday" is only answerable if
+      // it survives. last_seen_at carries recency instead.
+      //
+      // The gate verdict IS refreshed — the latest judgement is the most
+      // informed one, and a stale reason is worse than none.
       await this.pg.query(
         `INSERT INTO ${this.prefix}contradiction_signals
-          (user_id, session_id, fact_key, user_stated, stored_value, signal_type)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [userId, sessionId ?? null, factKey, userStated.slice(0, 500), storedValue.slice(0, 500), signalType]
+          (user_id, session_id, fact_key, user_stated, stored_value, signal_type,
+           gate_path, gate_similarity, gate_reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (user_id, fact_key, md5(stored_value)) WHERE surfaced = FALSE
+         DO UPDATE SET
+           repeat_count    = ${this.prefix}contradiction_signals.repeat_count + 1,
+           last_seen_at    = NOW(),
+           user_stated     = EXCLUDED.user_stated,
+           gate_path       = EXCLUDED.gate_path,
+           gate_similarity = EXCLUDED.gate_similarity,
+           gate_reason     = EXCLUDED.gate_reason`,
+        [
+          userId, sessionId ?? null, factKey,
+          userStated.slice(0, 500), storedValue.slice(0, 500), signalType,
+          gate?.path ?? null,
+          typeof gate?.similarity === 'number' && gate.similarity >= 0 ? gate.similarity : null,
+          gate?.reason ? gate.reason.slice(0, 300) : null,
+        ]
       );
 
-      this.logger.debug('Contradiction signal created', { userId, factKey, signalType });
+      this.logger.debug('Contradiction signal recorded', {
+        userId, factKey, signalType, gatePath: gate?.path,
+      });
     } catch (error) {
       this.logger.error('createSignal failed', { error: (error as Error).message });
     }
@@ -145,7 +262,10 @@ export class ContradictionService {
    * "you said X" before extraction even runs.
    */
   detectInline(message: string, facts: Fact[]): InlineContradiction[] {
+    if (!this.inlineEnabled) return [];
+
     const contradictions: InlineContradiction[] = [];
+    const seenKeys = new Set<string>();
     const messageLower = message.toLowerCase();
     const messageWords = messageLower.split(/\s+/);
 
@@ -176,16 +296,28 @@ export class ContradictionService {
       // confirming, not changing.
       if (messageLower.includes(fact.factValue.toLowerCase())) continue;
 
-      for (const candidate of capitalizedWords) {
-        if (candidate.toLowerCase() === fact.factValue.toLowerCase()) continue;
-        contradictions.push({
-          factKey: fact.factKey,
-          factCategory: fact.category,
-          storedValue: fact.factValue,
-          suspectedValue: candidate,
-        });
-        break;
-      }
+      // PROXIMITY, not "any capitalized word in the message". Without this, a
+      // message containing several proper nouns pairs EVERY concept-matching
+      // fact with the first one, and one message produced 35 phantom
+      // contradictions — each a confident claim that the user had changed their
+      // mind about something they never mentioned.
+      const candidate = this.nearestCandidate(messageWords, capitalizedWords, conceptTokens);
+      if (!candidate) continue;
+      if (candidate.toLowerCase() === fact.factValue.toLowerCase()) continue;
+      if (seenKeys.has(fact.factKey)) continue;
+
+      seenKeys.add(fact.factKey);
+      contradictions.push({
+        factKey: fact.factKey,
+        factCategory: fact.category,
+        storedValue: fact.factValue,
+        suspectedValue: candidate,
+      });
+
+      // Hard cap. Past a handful this is not a memory check any more, it is an
+      // interrogation, and the sheer volume is itself evidence the detector is
+      // wrong rather than the user.
+      if (contradictions.length >= MAX_INLINE_CONTRADICTIONS) break;
     }
 
     return contradictions;

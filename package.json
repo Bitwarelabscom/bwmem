@@ -1,7 +1,7 @@
 {
   "name": "@bitwarelabs/bwmem",
-  "version": "0.3.0",
-  "description": "Memory SDK for AI chatbots - bi-temporal facts, semantic search, emotional capture, contradiction detection, quality scoring, session texture, self-intentions, multi-stage consolidation",
+  "version": "0.5.0",
+  "description": "Memory SDK for AI chatbots - bi-temporal facts, same-claim merge gates, semantic search, contradiction detection with provenance, quality scoring, session texture, self-intentions, multi-stage consolidation",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -95,7 +95,7 @@
     "vitest": "^3.2.1"
   },
   "peerDependencies": {
-    "neo4j-driver": "^5.0.0",
+    "neo4j-driver": "^5 || ^6",
     "openai": "^4.0.0"
   },
   "peerDependenciesMeta": {

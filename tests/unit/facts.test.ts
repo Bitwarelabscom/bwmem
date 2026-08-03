@@ -67,7 +67,8 @@ describe('FactsService', () => {
 
   describe('storeFact', () => {
     it('inserts a new fact when none exists', async () => {
-      // transaction mock: first query (SELECT existing) returns empty, second (INSERT) returns new row
+      // Query order inside the transaction: advisory lock, SELECT existing, INSERT.
+      pg.willReturn([]); // pg_advisory_xact_lock
       pg.willReturn([]); // no existing fact
       pg.willReturn([{
         id: 'new-fact-1',
@@ -96,6 +97,7 @@ describe('FactsService', () => {
     });
 
     it('bumps mention_count when storing same value', async () => {
+      pg.willReturn([]); // pg_advisory_xact_lock
       pg.willReturn([{
         id: 'existing-1',
         fact_value: 'Alice',

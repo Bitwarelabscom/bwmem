@@ -1,0 +1,59 @@
+name: CI
+
+# There was no CI. Every release before 0.5.0 was published on the word of
+# whoever ran the tests locally, which is exactly how a package ships a headline
+# feature that emits 35 phantom results on one input.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor is the engines field; the ceiling is what people actually run.
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+  # The published tarball is not the repo: `files` decides what ships, and a
+  # missing migration only shows up on someone else's fresh install.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+      - name: Every migration is in the tarball
+        run: |
+          npm pack --silent >/dev/null
+          tar -tzf bitwarelabs-bwmem-*.tgz > files.txt
+          missing=0
+          for f in src/db/migrations/*.sql; do
+            grep -q "package/$f" files.txt || { echo "MISSING FROM TARBALL: $f"; missing=1; }
+          done
+          test "$missing" -eq 0

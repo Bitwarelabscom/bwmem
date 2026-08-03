@@ -54,10 +54,11 @@ export class SessionTextureService {
    */
   async capture(
     sessionId: string,
-    opts: { mode?: string; speaker?: string } = {},
+    opts: { mode?: string; speaker?: string; channel?: string } = {},
   ): Promise<void> {
     const mode = opts.mode || 'default';
     const speaker = opts.speaker || 'user';
+    const channel = opts.channel || 'default';
     try {
       const session = await this.pg.queryOne<SessionRow>(
         `SELECT user_id, metadata FROM ${this.prefix}sessions WHERE id = $1`,
@@ -107,17 +108,25 @@ export class SessionTextureService {
         return;
       }
 
-      // Latest-per-relationship: drop prior rows for this (user, mode, speaker), then insert.
-      await this.pg.query(
-        `DELETE FROM ${this.prefix}session_textures
-          WHERE user_id = $1 AND mode = $2 AND speaker = $3`,
-        [session.user_id, mode, speaker],
-      );
+      // Latest-per-relationship, where the relationship includes the CHANNEL:
+      // how a conversation felt over voice does not carry to text, and blending
+      // the two produces a throughline that matches neither.
+      //
+      // One upsert rather than DELETE-then-INSERT: the pair was not atomic, so a
+      // concurrent read between them saw no texture at all and opened the next
+      // session cold.
       await this.pg.query(
         `INSERT INTO ${this.prefix}session_textures
-           (user_id, session_id, mode, speaker, throughline, emotional_register)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [session.user_id, sessionId, mode, speaker, parsed.throughline, parsed.emotionalRegister],
+           (user_id, session_id, mode, speaker, channel, throughline, emotional_register)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (user_id, mode, speaker, channel)
+         DO UPDATE SET
+           session_id         = EXCLUDED.session_id,
+           throughline        = EXCLUDED.throughline,
+           emotional_register = EXCLUDED.emotional_register,
+           created_at         = NOW()`,
+        [session.user_id, sessionId, mode, speaker, channel,
+         parsed.throughline, parsed.emotionalRegister],
       );
 
       // Bounded retention sweep (best-effort)
@@ -140,17 +149,18 @@ export class SessionTextureService {
    */
   async getForPrompt(
     userId: string,
-    opts: { mode?: string; speaker?: string } = {},
+    opts: { mode?: string; speaker?: string; channel?: string } = {},
   ): Promise<string> {
     const mode = opts.mode || 'default';
     const speaker = opts.speaker || 'user';
+    const channel = opts.channel || 'default';
     try {
       const r = await this.pg.queryOne<{ throughline: string; emotional_register: string; created_at: Date }>(
         `SELECT throughline, emotional_register, created_at
            FROM ${this.prefix}session_textures
-          WHERE user_id = $1 AND mode = $2 AND speaker = $3
+          WHERE user_id = $1 AND mode = $2 AND speaker = $3 AND channel = $4
           ORDER BY created_at DESC LIMIT 1`,
-        [userId, mode, speaker],
+        [userId, mode, speaker, channel],
       );
       if (!r) return '';
 
