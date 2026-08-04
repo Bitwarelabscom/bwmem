@@ -55,6 +55,7 @@ long-term-memory benchmark.
 
 | System | Reader | k | Score |
 |---|---|---|---|
+| **bwmem's parent stack** | deepseek-v4-pro | 25 | **81.7%** |
 | **bwmem's parent stack** | gpt-4o | 25 | **78.3%** |
 | **bwmem's parent stack** | deepseek-v4-flash | 25 | **70.0%** |
 | bwmem's parent stack | gpt-4o | 8 | 65.0% |
@@ -67,6 +68,17 @@ Run conditions: a 60-question stratified subset of LongMemEval_S (cleaned), judg
 by the official `gpt-4o-2024-08-06` judge, seed `20260803`. That is **not** the
 full set, and the baselines are full-set numbers — so this is indicative, not
 like-for-like. The honest reading is "same league as Zep," not "beats Zep."
+
+The top three rows are a clean reader comparison: all three received
+**byte-identical retrieved context on all 60 questions** — same retrieval, same
+questions, only the reading model changed. That isolates the memory layer from
+model quality, which is the number worth having. It also means the open-weights
+reader beat gpt-4o on the same context for roughly a quarter of the cost
+(**$0.09 vs $0.32** across the 60 questions).
+
+**The error bar is about ±2 points.** Re-running the 81.7% configuration unchanged
+produced 83.3% — one question different. Any single run of anything on this
+benchmark, ours included, should be read with that in mind.
 
 ### Why the caveats are in the README and not in a footnote
 
