@@ -46,6 +46,61 @@ displaced). Run migration 015.
 - **Provider-agnostic** — works with OpenAI, Ollama, OpenRouter, or any custom provider
 - **REST API** — Fastify-based multi-tenant API with API key auth, rate limiting, usage tracking, and Swagger docs
 
+## Benchmark
+
+Memory systems are easy to describe and hard to verify, so the system bwmem was
+extracted from is measured against
+[LongMemEval](https://github.com/xiaowu0162/LongMemEval), the standard
+long-term-memory benchmark.
+
+| System | Reader | k | Score |
+|---|---|---|---|
+| **bwmem's parent stack** | gpt-4o | 25 | **78.3%** |
+| **bwmem's parent stack** | deepseek-v4-flash | 25 | **70.0%** |
+| bwmem's parent stack | gpt-4o | 8 | 65.0% |
+| bwmem's parent stack | deepseek-v4-flash | 8 | 60.0% |
+| Zep *(self-reported)* | — | — | 63.8–71.2% |
+| Full-context gpt-4o *(published)* | — | — | ~60% |
+| mem0 *(self-reported)* | — | — | ~49% |
+
+Run conditions: a 60-question stratified subset of LongMemEval_S (cleaned), judged
+by the official `gpt-4o-2024-08-06` judge, seed `20260803`. That is **not** the
+full set, and the baselines are full-set numbers — so this is indicative, not
+like-for-like. The honest reading is "same league as Zep," not "beats Zep."
+
+### Why the caveats are in the README and not in a footnote
+
+Most of the high scores on this benchmark come from arXiv preprints. They are
+**self-reported, not peer-reviewed, and — as far as we can find — never
+independently replicated.** Run the benchmark yourself against those systems and
+you tend to get a different number than the one on the chart. Treat every
+published memory-benchmark score, including this one, as a claim about a specific
+harness rather than a property of the system.
+
+What we can say about ours: we ran it, on our own hardware, and the harness,
+seed, judge and subset are stated above so it can be checked.
+
+**Benchmark numbers move a lot.** From our own runs — same 60 questions, same
+judge, same afternoon — scores ranged from **55.0% to 85.0%**, varying only by
+reader model and retrieval configuration. Recall depth alone (k from 8 to 25) is
+worth 13 points. An earlier run of the identical harness scored **15.0%**; that
+turned out to be three bugs, not an architecture — the episodic tier was silently
+dropping conversational text, retrieval was recency-only because nothing ever
+wrote the embeddings it was supposed to rank by, and entity extraction was a regex
+that promoted words like "Remember" to entities. A number without its harness
+tells you very little.
+
+### What was measured, precisely
+
+bwmem is extracted from a full, running AI agent, and the score above was measured
+on that agent's memory layer — same retrieval architecture (pgvector + bge-m3
+cosine recall over consolidated episodic content), same fact model, same
+consolidation staging. bwmem should land in the same range for that reason.
+
+But it is the parent stack's number, not bwmem's own: **bwmem has not yet been put
+through the harness as a package.** When it is, the result gets published here —
+whatever it says.
+
 ## Requirements
 
 - Node.js >= 18
