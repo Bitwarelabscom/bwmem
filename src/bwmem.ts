@@ -183,8 +183,10 @@ export class BwMem {
     const s = this.ensureReady();
     return {
       get: (userId: string, opts) => s.facts.getUserFacts(
-        userId, opts?.category, opts?.limit, opts?.intentId,
+        userId, opts?.category, opts?.limit, opts?.intentId, opts?.queryText,
       ),
+      searchRelevant: (userId, queryText, opts) =>
+        s.facts.searchRelevantFacts(userId, queryText, opts ?? {}),
       getAsOf: (userId, asOfValidTime, asOfTxnTime, opts) =>
         s.facts.getFactsAsOf(userId, asOfValidTime, asOfTxnTime, opts),
       store: (input) => s.facts.storeFact(input),
@@ -310,7 +312,22 @@ export class BwMem {
 }
 
 interface FactsAPI {
-  get(userId: string, opts?: { category?: string; limit?: number; intentId?: string | null }): Promise<Fact[]>;
+  get(userId: string, opts?: {
+    category?: string;
+    limit?: number;
+    intentId?: string | null;
+    /**
+     * Free text (typically the current message). Appends facts that lexically
+     * overlap it to the popularity-ranked `limit` window, which is otherwise
+     * the same on every turn regardless of the question. Additive: nothing in
+     * the core set is displaced.
+     */
+    queryText?: string;
+  }): Promise<Fact[]>;
+  /** Facts overlapping `queryText`, ranked by that overlap. */
+  searchRelevant(userId: string, queryText: string, opts?: {
+    category?: string; intentId?: string | null; limit?: number;
+  }): Promise<Fact[]>;
   getAsOf(
     userId: string,
     asOfValidTime?: Date,

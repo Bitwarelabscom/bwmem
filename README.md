@@ -10,6 +10,19 @@ Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: bi-tempo
 
 Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, response quality scoring, and long-term memory consolidation in the background.
 
+**v0.5.1 — upgrade if you pass `intentId` anywhere.** `facts.get()` treated an
+absent intent as *"return only unscoped facts"*, and `buildContext()` calls it that
+way with no option to do otherwise. Any fact written via `store({ intentId })` was
+therefore unreachable from the context the SDK exists to build — silently, with no
+error. Intent is now a **ranking preference** (the given intent first, then unscoped,
+then the rest) rather than a filter, and one fact key resolves to one winner across
+intents instead of competing rows. Passing `intentId: null` still means
+"unscoped only" if you were relying on that. Also adds `queryText` / `facts.searchRelevant()`:
+the `limit` window is ordered by mention count and is otherwise identical on every
+turn, so a fact mentioned once or twice could never surface however relevant it was —
+matches on the current message are now appended to it (additive; the core set is never
+displaced). Run migration 015.
+
 **v0.5.0** adds same-claim merge gates on both the key and value axes, contradiction signals that count the disagreement rather than the mentions, a timeline index for ordering questions, and a per-channel session texture. It also fixes two defects in earlier releases: a dedup scope that produced duplicate active facts, and an inline contradiction scan that over-fired.
 
 ## Features

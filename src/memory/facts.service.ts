@@ -122,6 +122,28 @@ export function isMergeableFactKey(key: string): boolean {
   return !isVolatileFactKey(key) && !isSetValuedFactKey(key) && !isSpeakerFact(key);
 }
 
+/** Max terms lifted from one message into a relevance tsquery. */
+const MAX_QUERY_TERMS = 25;
+
+/**
+ * Turn free text into an OR'd tsquery string, or null if nothing is matchable.
+ *
+ * OR rather than AND is the whole point. `plainto_tsquery` and
+ * `websearch_to_tsquery` AND their terms, and a fact is a short string that
+ * will only ever carry one or two of a message's words — requiring all of them
+ * matches nothing ("what is my cat called" would need a single fact containing
+ * both 'cat' AND 'call').
+ *
+ * Tokenising here rather than via `tsvector_to_array` also keeps a message made
+ * entirely of stopwords from ever reaching the `''::tsquery` cast.
+ */
+export function messageToOrQuery(text: string): string | null {
+  const matched = text.match(/[a-zà-ÿ0-9]{3,}/gi) ?? [];
+  const terms = Array.from(new Set(matched.map((t: string) => t.toLowerCase())))
+    .slice(0, MAX_QUERY_TERMS);
+  return terms.length > 0 ? terms.join(' | ') : null;
+}
+
 function mapRowToFact(row: Record<string, unknown>): Fact {
   return {
     id: row.id as string,
@@ -188,21 +210,52 @@ export class FactsService {
     this.keyMerge = keyMerge;
   }
 
-  /** Get active facts for a user with priority-aware deduplication. */
+  /**
+   * Get active facts for a user with priority-aware deduplication.
+   *
+   * `intentId` semantics (changed in 0.5.1 — see below):
+   * - `undefined` — **no scoping**. Every active fact is a candidate; unscoped
+   *   facts rank above intent-scoped ones. This is the default and what
+   *   {@link ContextBuilder} uses.
+   * - `null` — explicitly "unscoped only". Filters to `intent_id IS NULL`.
+   * - a uuid — prefer that intent, then unscoped, then everything else.
+   *
+   * 0.5.1 fixes a defect in the `undefined` branch. It used to apply
+   * `AND intent_id IS NULL`, which made every fact stored with an `intentId`
+   * unreachable from the context builder — `build()` calls this with
+   * `undefined` and has no way to pass one. So `store({ intentId })` wrote a
+   * fact that `buildContext()` could never surface. In the system this SDK was
+   * extracted from, the same bug hid 2,107 of 2,261 active facts (93%).
+   *
+   * `null` still means unscoped-only, so callers who deliberately relied on
+   * that filter keep an exact way to ask for it.
+   */
   async getUserFacts(
     userId: string,
     category?: string,
     limit = 50,
     intentId?: string | null,
+    queryText?: string,
   ): Promise<Fact[]> {
     try {
-      const params: unknown[] = [userId];
+      // Always bound as $2 so the ranking CASE can reference it whether or not
+      // the caller scoped the read. `undefined` and `null` both bind SQL NULL;
+      // they differ only in the WHERE clause below.
+      const params: unknown[] = [userId, intentId ?? null];
+      const intentRank = `
+              CASE WHEN $2::uuid IS NOT NULL AND intent_id = $2::uuid THEN 0
+                   WHEN intent_id IS NULL THEN 1
+                   ELSE 2 END`;
       let sql = `
         WITH ranked AS (
-          SELECT *, ROW_NUMBER() OVER (
-            PARTITION BY category, fact_key,
-              COALESCE(intent_id, '00000000-0000-0000-0000-000000000000'::uuid)
+          SELECT *, ${intentRank} AS intent_rank,
+            ROW_NUMBER() OVER (
+            -- Partitioned WITHOUT intent_id: one key resolves to one winner
+            -- across every intent. Including it (pre-0.5.1) meant a key held
+            -- under two intents produced two competing rows in the same result.
+            PARTITION BY category, fact_key
             ORDER BY
+              ${intentRank},
               CASE WHEN fact_type = 'temporary' AND fact_status = 'active'
                    AND (valid_until IS NULL OR valid_until > NOW())
                    THEN 0 ELSE 1 END,
@@ -219,27 +272,120 @@ export class FactsService {
         params.push(category);
       }
 
-      if (intentId === undefined) {
-        // No intent scoping — return only unscoped (general) facts.
+      // Only an EXPLICIT null still filters. `undefined` (no opinion) and a uuid
+      // (a preference) both leave the candidate set whole and let the rank decide.
+      if (intentId === null) {
         sql += ` AND intent_id IS NULL`;
-      } else if (intentId === null) {
-        sql += ` AND intent_id IS NULL`;
-      } else {
-        // Intent scoping — return both the intent's own facts and unscoped ones.
-        sql += ` AND (intent_id = $${params.length + 1} OR intent_id IS NULL)`;
-        params.push(intentId);
       }
 
       sql += `)
         SELECT * FROM ranked WHERE rn = 1
-        ORDER BY intent_id NULLS LAST, mention_count DESC, last_mentioned DESC
+        ORDER BY intent_rank, mention_count DESC, last_mentioned DESC
+        LIMIT $${params.length + 1}`;
+      params.push(limit);
+
+      // The popularity-ranked core set and the relevance-matched set are
+      // independent reads, so pay for them concurrently rather than in series.
+      const [rows, relevant] = await Promise.all([
+        this.pg.query<Record<string, unknown>>(sql, params),
+        queryText
+          ? this.searchRelevantFacts(userId, queryText, { category, intentId })
+          : Promise.resolve([] as Fact[]),
+      ]);
+
+      const core = rows.map(mapRowToFact);
+      if (relevant.length === 0) return core;
+
+      // Additive: the core set is never displaced, only extended.
+      const seen = new Set(core.map(f => f.id));
+      return core.concat(relevant.filter(f => !seen.has(f.id)));
+    } catch (error) {
+      this.logger.error('getUserFacts failed', { error: (error as Error).message, userId });
+      return [];
+    }
+  }
+
+  /**
+   * Facts that lexically overlap what is being said, ranked by that overlap.
+   *
+   * Complements the `limit` window in {@link getUserFacts}, which is ordered by
+   * `mention_count` and therefore identical on every turn no matter what the
+   * user asked. Anything mentioned once or twice can never enter that window,
+   * however relevant it is right now. This is the path that reaches it.
+   *
+   * Deliberately lexical rather than embedding-based: facts are very short
+   * strings ("Max", "06:00", "pitbulls"), cosine over short text is
+   * length-biased enough to be unreliable, and it would mean embedding and
+   * re-embedding the whole fact store. Word overlap on `fact_key + fact_value`
+   * is crude but predictable, and the key carries most of the topic signal once
+   * its underscores are split ("cat_name" -> "cat name").
+   *
+   * Best-effort: any failure returns `[]` so the core set still stands.
+   */
+  async searchRelevantFacts(
+    userId: string,
+    queryText: string,
+    opts: { category?: string; intentId?: string | null; limit?: number } = {},
+  ): Promise<Fact[]> {
+    const { category, intentId, limit = 15 } = opts;
+    const tsq = messageToOrQuery(queryText);
+    if (!tsq) return [];
+
+    try {
+      const params: unknown[] = [userId, intentId ?? null, tsq];
+      // Weighted A/B: the key carries the topic and many values are bare, so an
+      // unweighted vector ties a key match with a value match on a common word.
+      const doc = `setweight(to_tsvector('english', replace(fact_key, '_', ' ')), 'A') ||
+                   setweight(to_tsvector('english', fact_value), 'B')`;
+      // The filter uses the UNWEIGHTED expression so it can be served by the
+      // GIN index from migration 015 — keep the two in sync.
+      const filter = `to_tsvector('english', replace(fact_key, '_', ' ') || ' ' || fact_value)`;
+      let sql = `
+        WITH ranked AS (
+          SELECT *,
+            ts_rank(${doc}, to_tsquery('english', $3)) AS relevance,
+            ROW_NUMBER() OVER (
+              PARTITION BY category, fact_key
+              ORDER BY
+                CASE WHEN $2::uuid IS NOT NULL AND intent_id = $2::uuid THEN 0
+                     WHEN intent_id IS NULL THEN 1
+                     ELSE 2 END,
+                override_priority DESC, mention_count DESC, last_mentioned DESC
+            ) AS rn
+          FROM ${this.prefix}facts
+          WHERE user_id = $1
+            AND fact_status = 'active'
+            AND NOT (fact_type = 'temporary' AND valid_until IS NOT NULL AND valid_until <= NOW())
+            AND ${filter} @@ to_tsquery('english', $3)
+      `;
+
+      if (category) {
+        sql += ` AND category = $${params.length + 1}`;
+        params.push(category);
+      }
+      if (intentId === null) {
+        sql += ` AND intent_id IS NULL`;
+      }
+
+      // Relative floor, never absolute. ts_rank falls off with the number of
+      // query terms, so the same fact scores very differently depending on how
+      // much text the caller passed: measured on the origin system, the top
+      // match was 0.6079 for a bare question and 0.1581 for the same question
+      // with three turns of context folded in. A fixed floor tuned on one shape
+      // silently empties the other.
+      sql += `), winners AS (SELECT * FROM ranked WHERE rn = 1)
+        SELECT w.* FROM winners w
+        WHERE w.relevance >= (SELECT MAX(relevance) FROM winners) * 0.5
+        ORDER BY w.relevance DESC, w.mention_count DESC, w.last_mentioned DESC
         LIMIT $${params.length + 1}`;
       params.push(limit);
 
       const rows = await this.pg.query<Record<string, unknown>>(sql, params);
       return rows.map(mapRowToFact);
     } catch (error) {
-      this.logger.error('getUserFacts failed', { error: (error as Error).message, userId });
+      this.logger.warn('searchRelevantFacts failed; core facts only', {
+        error: (error as Error).message, userId,
+      });
       return [];
     }
   }

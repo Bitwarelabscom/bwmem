@@ -60,8 +60,11 @@ describe('FactsService', () => {
     it('filters by category when provided', async () => {
       pg.willReturn([]);
       await facts.getUserFacts('user-1', 'personal');
-      expect(pg.lastQuery).toContain('category = $2');
-      expect(pg.lastParams?.[1]).toBe('personal');
+      // $3, not $2, since 0.5.1: the intent is now always bound as $2 so the
+      // ranking CASE can reference it whether or not the caller scoped the read.
+      // Only the bind position moved — category filtering is unchanged.
+      expect(pg.lastQuery).toContain('category = $3');
+      expect(pg.lastParams?.[2]).toBe('personal');
     });
   });
 

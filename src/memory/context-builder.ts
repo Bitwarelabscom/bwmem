@@ -61,7 +61,15 @@ export class ContextBuilder {
     const includeIntention = options?.includeIntentionPrompt === true;
 
     const results = await Promise.allSettled([
-      safeQuery('facts', this.facts.getUserFacts(userId, undefined, options?.maxFacts ?? 30), [], timeout, this.logger),
+      // `query` is also passed to the facts source (0.5.1): without it the fact
+      // window is ordered by mention_count alone and is therefore identical on
+      // every turn, so a fact mentioned once or twice can never surface however
+      // relevant it is. Relevance matches are appended to the core set, never
+      // substituted for it. intentId stays undefined = no scoping (see
+      // getUserFacts) — before 0.5.1 that silently excluded every scoped fact.
+      safeQuery('facts', this.facts.getUserFacts(
+        userId, undefined, options?.maxFacts ?? 30, undefined, query,
+      ), [], timeout, this.logger),
       safeQuery('similarMessages', query
         ? this.embedding.searchSimilarMessages(userId, query, options?.maxSimilarMessages ?? 5, options?.similarityThreshold ?? 0.25, sessionId)
         : Promise.resolve([]), [], timeout, this.logger),
