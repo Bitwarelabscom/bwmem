@@ -1,5 +1,11 @@
 # @bitwarelabs/bwmem
 
+[![npm](https://img.shields.io/npm/v/@bitwarelabs/bwmem?logo=npm)](https://www.npmjs.com/package/@bitwarelabs/bwmem)
+![Node](https://img.shields.io/badge/Node-%E2%89%A518-339933?logo=node.js&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-%2B%20pgvector-4169E1?logo=postgresql&logoColor=white)
+![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
+
 Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: bi-temporal facts, semantic search, emotional capture, contradiction detection, quality scoring, session-texture carryover, held intentions, knowledge graph, and multi-stage consolidation.
 
 Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, response quality scoring, and long-term memory consolidation in the background.
