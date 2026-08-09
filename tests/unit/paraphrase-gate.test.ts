@@ -113,6 +113,59 @@ describe('ParaphraseGate', () => {
     expect(v.path).toBe('gate_separate');
   });
 
+  // `compatible: false` means two unrelated things, and a surface reading only
+  // that flag cannot tell a real value swap from a statement that simply
+  // answers a different question than the key asks.
+  it('marks a different-question separation as its own path', async () => {
+    const gate = new ParaphraseGate(
+      embeddings(same),
+      new FactMergeGate(
+        llm('{"compatible":false,"separation":"different_question","reason":"a role, not the company name"}'),
+        mockLogger,
+      ),
+      mockLogger,
+    );
+    const v = await gate.isSemanticParaphrase('company_name', 'Acme', 'member of the dev team at Acme');
+    // The signal still fires — only the path carries the distinction, so no
+    // caller's behaviour changes silently.
+    expect(v.paraphrase).toBe(false);
+    expect(v.path).toBe('gate_different_question');
+  });
+
+  it('keeps a conflicting answer on the plain separate path', async () => {
+    const gate = new ParaphraseGate(
+      embeddings(same),
+      new FactMergeGate(
+        llm('{"compatible":false,"separation":"conflicting_answer","reason":"battery vs USB"}'),
+        mockLogger,
+      ),
+      mockLogger,
+    );
+    const v = await gate.isSemanticParaphrase('esp32_power', 'on battery', 'on USB power');
+    expect(v.path).toBe('gate_separate');
+  });
+
+  it('does NOT let a missing separation discount the signal', async () => {
+    // Null means the model did not say. An older model, a truncated reply or a
+    // prompt regression must not be able to downgrade a contradiction by
+    // omission, so null falls through to the plain path.
+    const gate = new ParaphraseGate(
+      embeddings(same),
+      new FactMergeGate(llm('{"compatible":false,"reason":"no separation field"}'), mockLogger),
+      mockLogger,
+    );
+    expect((await gate.isSemanticParaphrase('k', 'a', 'b')).path).toBe('gate_separate');
+  });
+
+  it('does NOT accept an invented separation value', async () => {
+    const gate = new ParaphraseGate(
+      embeddings(same),
+      new FactMergeGate(llm('{"compatible":false,"separation":"unrelated","reason":"x"}'), mockLogger),
+      mockLogger,
+    );
+    expect((await gate.isSemanticParaphrase('k', 'a', 'b')).path).toBe('gate_separate');
+  });
+
   it('skips the LLM entirely below the floor', async () => {
     let called = 0;
     const gate = new ParaphraseGate(

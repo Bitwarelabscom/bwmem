@@ -42,6 +42,7 @@ displaced). Run migration 015.
 - **Context builder** — aggregates 11 memory sources into a single formatted prompt injection
 - **Same-claim gates** — decision-compatibility adjudication on the key and value axes (0.5.0)
 - **Timeline index** — ordering and elapsed-time questions become a sort, not a search (0.5.0)
+- **Cross-key collisions** — the guard every other check is blind to: one subject filed under two categories that cannot both be true, each row internally coherent (0.6.0)
 - **Knowledge graph** — Neo4j integration with schema-constrained entity relationships (27 types), entity-to-entity edges, and entity-scoped subgraphs
 - **Provider-agnostic** — works with OpenAI, Ollama, OpenRouter, or any custom provider
 - **REST API** — Fastify-based multi-tenant API with API key auth, rate limiting, usage tracking, and Swagger docs
@@ -165,6 +166,112 @@ await mem.textures.capture(session.id); // anchor for the next session
 
 await mem.shutdown();
 ```
+
+## What's new in 0.6.0
+
+### A bug that made "temporary" meaningless
+
+A fact typed `temporary` with no `valid_until` was **immortal**. Both expiry
+paths required `valid_until IS NOT NULL`, and only present-tense `current_*`
+keys ever get a TTL stamped on write — while the extraction prompt tells the
+model to type a fact `temporary` whenever a state is transient, and to leave
+`validUntil` unset when the state has no clear end ("doing evenings for a
+while"). So every transient fact whose key was not present-tense-shaped lived
+forever.
+
+On the install this was found on: **579 active `temporary` rows, zero carrying a
+TTL, 400 of them older than fourteen days** — including eighteen mutually
+exclusive vacation states, all active, all believed at once ("on vacation" from
+February sitting beside "no more vacation" from July).
+
+Expiry now has a second branch, tunable and reversible:
+
+```typescript
+await mem.facts.expireTemporary();      // 30 days untended, the default
+await mem.facts.expireTemporary(7);     // stricter
+await mem.facts.expireTemporary(Infinity); // old behaviour: valid_until only
+```
+
+Age is measured from `COALESCE(last_mentioned, updated_at, created_at)`.
+`last_mentioned` bumps on re-assertion and never on read, so a state still being
+said out loud stays live and is not swept. Note the trade this makes: the type
+is set by the extractor and is sometimes wrong, so this **will** expire a
+durable fact that was mistyped. That is a status flip, never a delete.
+
+### Cross-key collisions
+
+Every guard in this SDK compares a new value against the old value of the **same
+`fact_key`** — the contradiction gate, the paraphrase gate, the merge gate, the
+key-axis merge, the pruner. So two rows under *different* keys can each be
+internally coherent, both be marked active, and flatly contradict one another,
+and nothing ever looks.
+
+The shape that motivated it: a pet named Gaia filed as `cat_name_gaia='Gaia'`
+and `cat_names='Nalla, Gaia, Max'` while also filed as `dog_names='Nalla and
+Gaia'` and `dog_behavior_gaia='Gaia is the troublemaker'` — every row active, for
+weeks. The assistant called her a cat or a dog depending on which row retrieval
+happened to surface.
+
+```typescript
+const { open, residues } = await mem.collisions.refresh(userId);
+// open[0]  -> "Gaia is filed as a cat and as a dog", with both sides' rows
+
+await mem.collisions.settle(userId, 'Gaia', 'They are dogs.', 'dog');
+// -> { settled: 1, family: 'species', residue: [cat_names, cat_name_gaia] }
+```
+
+**Nothing here writes to your facts table.** It never merges, never deletes and
+never picks a winner — which of two coherent rows is wrong is a judgement the
+store has no evidence for, since both were asserted in good faith. It raises the
+pair; `facts.store` / `facts.remove` are how you act on it.
+
+**Settling requires the side you kept, and that is the design.** A settle that
+records only a note is a *mute*: it suppresses the flag while every losing-side
+row stays active and retrievable. One such settle claimed the wrong rows had
+been corrected — they had not, and five wrong rows stayed live for 23 hours with
+the surface showing nothing. And because a collision's identity is its key list,
+*correcting* a fact changed the signature and minted a fresh alarm: acting on a
+clash brought it back, doing nothing made it vanish forever. Exactly backwards.
+
+With a decision on record the clash is never re-raised. What surfaces instead is
+the **residue** — the still-active facts that contradict the decision — which
+shrinks as you correct them and drops off the surface on its own. `settle`
+returns that residue as measured at the moment you settled, so a settle can no
+longer quietly hide anything.
+
+The default axis (cat vs dog) is a demonstration, not your domain. Supply your
+own:
+
+```typescript
+const mem = new BwMem({
+  ...,
+  exclusiveFamilies: [{
+    name: 'employment',
+    members: { employed: ['employer', 'employed'], retired: ['retired', 'retirement'] },
+  }],
+});
+```
+
+Keep any family **narrow**. Members must be genuine alternatives — one subject
+cannot be both without one row being false. Categories that merely differ
+(`pet` vs `dog`; a dog *is* a pet) produce a flag that is wrong on every pass,
+and a surface that cries wolf is worse than no surface at all.
+
+### The merge gate says *which kind* of separation
+
+`compatible: false` has always meant two different things at once, and a
+contradiction surface reading only that flag cannot tell them apart. The gate now
+also returns `separation`:
+
+- `different_question` — the new statement answers something the key never asked
+  (a role where the key names a company). Nothing is being contradicted, and the
+  paraphrase gate reports it on its own `gate_different_question` path.
+- `conflicting_answer` — both statements answer the key and disagree. A real
+  value swap.
+
+`null` means the model did not say, and null never suppresses: an older model, a
+truncated reply or a prompt regression must not be able to discount a
+contradiction by omission.
 
 ## What's new in 0.5.0
 
@@ -630,10 +737,41 @@ if (match) await mem.facts.touchMention(match.id);
 
 const results = await mem.facts.search('user-123', 'programming tools');
 await mem.facts.remove(factId);
-await mem.facts.expireTemporary(); // sweep expired temp facts
+
+// Sweep temporaries: past valid_until, plus untimed ones untended for N days
+// (default 30). Without that second branch an untimed temporary never expires.
+await mem.facts.expireTemporary();
 ```
 
 **Fact categories:** `personal`, `work`, `preference`, `hobby`, `relationship`, `goal`, `context`
+
+#### `mem.collisions`
+
+One subject filed under two categories that cannot both be true. Reads facts;
+never writes them.
+
+```typescript
+// Detect, file and close in one pass. Run it on a schedule.
+const { open, raised, resolved, residues } = await mem.collisions.refresh('user-123');
+
+const clashes = await mem.collisions.list('user-123');          // open only
+const all     = await mem.collisions.list('user-123', true);    // including closed
+const n       = await mem.collisions.countOpen('user-123');
+
+// Closing one REQUIRES the side you kept — a note alone is a mute, not a
+// decision. Returns what still contradicts it, measured right then.
+const { residue, error } = await mem.collisions.settle(
+  'user-123', 'Gaia', 'They are dogs; the cat rows are wrong.', 'dog',
+);
+
+// Every decision on record, measured against the facts as they are now.
+const standing = await mem.collisions.residues('user-123');
+```
+
+`settle` returns `error` instead of recording anything when the category is not
+one of your configured families — a typo would otherwise mint a decision whose
+residue is every row on the subject, which reads like a repair list and is
+nothing of the kind.
 
 #### `mem.contradictions`
 

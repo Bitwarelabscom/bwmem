@@ -59,6 +59,19 @@ export interface BwMemConfig {
    * question class.
    */
   temporalIndex?: boolean;
+
+  /**
+   * Which category axes are mutually exclusive, for the cross-key collision
+   * check. Defaults to DEFAULT_EXCLUSIVE_FAMILIES (cat vs dog), which is a
+   * sensible demonstration and almost certainly not your domain.
+   *
+   * Keep any family you add NARROW. Members must be genuine alternatives: one
+   * subject cannot be both without one of the rows being false. Categories that
+   * merely differ ('pet' vs 'dog' — a dog IS a pet) produce a flag that is
+   * wrong on every pass, and a surface that cries wolf is worse than no
+   * surface.
+   */
+  exclusiveFamilies?: import('./memory/fact-collision.service.js').ExclusiveFamily[];
 }
 
 export interface PostgresConfig {

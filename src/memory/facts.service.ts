@@ -916,20 +916,53 @@ Return [] if no facts found.`;
   }
 
   /**
-   * Expire active temporary facts whose valid_until has passed. Sets
-   * fact_status='expired' and stamps superseded_at. Returns the count expired.
-   * Call from a periodic job.
+   * Expire active temporary facts. Sets fact_status='expired' and stamps
+   * superseded_at. Returns the count expired. Call from a periodic job.
+   *
+   * Two branches, because a `temporary` fact does not always carry a deadline:
+   *
+   *  1. valid_until has passed — the plain case.
+   *  2. valid_until IS NULL and the fact has gone untended for
+   *     `untimedMaxAgeDays`. This branch used to be missing entirely, and
+   *     without it an untimed temporary was IMMORTAL. Only `current_*` keys get
+   *     a TTL stamped on write (EPHEMERAL_FACT_TTL_MS above); the extraction
+   *     prompt meanwhile tells the model to type a fact 'temporary' whenever a
+   *     state is transient, and to leave validUntil unset when the state has no
+   *     clear end ("doing evenings for a while"). So every transient fact whose
+   *     key was not present-tense-shaped lived forever, and a store would
+   *     accumulate a stack of mutually exclusive states — "on vacation",
+   *     "vacation ended" — all active, all believed at once.
+   *
+   * Age is measured from COALESCE(last_mentioned, updated_at, created_at).
+   * last_mentioned bumps on re-assertion and never on read, so a state that is
+   * still being said out loud stays live and is not swept; only genuinely
+   * untended ones age out.
+   *
+   * Caveat worth knowing before you tune this down: the type is set by the
+   * extractor and is sometimes wrong, so this branch will expire a durable fact
+   * that was mistyped 'temporary'. It is reversible — a status flip, never a
+   * delete — but that is the trade the second branch makes.
+   *
+   * @param untimedMaxAgeDays how long an untimed temporary may go untended
+   *        before it ages out. Pass Infinity to disable branch 2 entirely.
    */
-  async expireTemporaryFacts(): Promise<number> {
+  async expireTemporaryFacts(untimedMaxAgeDays = 30): Promise<number> {
+    const untimed = Number.isFinite(untimedMaxAgeDays) && untimedMaxAgeDays > 0
+      ? Math.round(untimedMaxAgeDays)
+      : null;
     try {
       const rows = await this.pg.query<{ id: string }>(
         `UPDATE ${this.prefix}facts
             SET fact_status = 'expired', superseded_at = NOW(), updated_at = NOW()
           WHERE fact_status = 'active'
             AND fact_type = 'temporary'
-            AND valid_until IS NOT NULL
-            AND valid_until <= NOW()
+            AND ( (valid_until IS NOT NULL AND valid_until <= NOW())
+                  OR ($1::int IS NOT NULL
+                      AND valid_until IS NULL
+                      AND COALESCE(last_mentioned, updated_at, created_at)
+                          <= NOW() - ($1::int * interval '1 day')) )
           RETURNING id`,
+        [untimed],
       );
       if (rows.length > 0) {
         this.logger.info('Expired temporary facts', { count: rows.length });

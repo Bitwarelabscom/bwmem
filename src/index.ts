@@ -97,7 +97,9 @@ export {
 // the key axis and the value axis — two independent notions disagree, and the
 // disagreement shows up as facts that merge but still contradict themselves.
 export { FactMergeGate } from './memory/fact-merge-gate.service.js';
-export type { MergeGateVerdict, MergeGateOutcome } from './memory/fact-merge-gate.service.js';
+export type {
+  MergeGateVerdict, MergeGateOutcome, MergeSeparation,
+} from './memory/fact-merge-gate.service.js';
 export { ParaphraseGate, shouldConsultGate, cosineSimilarity } from './memory/paraphrase-gate.service.js';
 export type { ParaphraseVerdict, ParaphraseGatePath } from './memory/paraphrase-gate.service.js';
 export { FactKeyMerge, rankMergeCandidates } from './memory/fact-key-merge.service.js';
@@ -108,3 +110,19 @@ export type { MergeCandidate, SameClaimMatch } from './memory/fact-key-merge.ser
 // near three events at once.
 export { TemporalEventsService } from './memory/temporal-events.service.js';
 export type { TemporalEvent } from './memory/temporal-events.service.js';
+
+// Cross-key collisions (0.6.0). Every other guard compares a new value against
+// the old value of the SAME fact_key, so two rows under DIFFERENT keys can each
+// be coherent, both be active, and flatly contradict one another unseen. The
+// detection rules are exported as pure functions because that is how they are
+// tested — and because a false alarm on this surface is expensive.
+export {
+  FactCollisionService, DEFAULT_EXCLUSIVE_FAMILIES,
+  findCollisions, residueFor, categoriseKey, familyOfCategory,
+  knownCategories, keyTokens, properNounsIn,
+  describeCollision, describeDecision,
+} from './memory/fact-collision.service.js';
+export type {
+  ExclusiveFamily, CategoryCollision, CollisionFact, ActiveFactRow,
+  StoredCollision, DecisionResidue, SettleResult,
+} from './memory/fact-collision.service.js';

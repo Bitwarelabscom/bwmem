@@ -25,6 +25,10 @@ import { SentimentService } from './memory/sentiment.service.js';
 import { CentroidService } from './memory/centroid.service.js';
 import { EmotionalMomentsService } from './memory/emotional-moments.service.js';
 import { TemporalEventsService } from './memory/temporal-events.service.js';
+import { FactCollisionService } from './memory/fact-collision.service.js';
+import type {
+  StoredCollision, DecisionResidue, SettleResult,
+} from './memory/fact-collision.service.js';
 import { FactMergeGate } from './memory/fact-merge-gate.service.js';
 import { FactKeyMerge } from './memory/fact-key-merge.service.js';
 import { ParaphraseGate } from './memory/paraphrase-gate.service.js';
@@ -52,6 +56,7 @@ interface Services {
   behavioral: BehavioralService;
   summaries: SummariesService;
   temporalEvents: TemporalEventsService;
+  factCollisions: FactCollisionService;
   qualityScorer: QualityScorerService;
   sessionTexture: SessionTextureService;
   selfIntention: SelfIntentionService;
@@ -118,6 +123,9 @@ export class BwMem {
       new ParaphraseGate(this.config.embeddings, mergeGate, logger),
     );
     const behavioral = new BehavioralService(pg, prefix, logger);
+    const factCollisions = new FactCollisionService(
+      pg, prefix, logger, this.config.exclusiveFamilies,
+    );
     const summaries = new SummariesService(pg, this.config.llm, embedding, prefix, logger);
     const qualityScorer = new QualityScorerService(pg, this.config.llm, this.config.embeddings, prefix, logger);
     const sessionTexture = new SessionTextureService(pg, this.config.llm, prefix, logger);
@@ -149,6 +157,7 @@ export class BwMem {
     this.services = {
       pg, redis, facts, embedding, sentiment, centroid,
       emotionalMoments, contradictions, behavioral, summaries, temporalEvents,
+      factCollisions,
       qualityScorer, sessionTexture, selfIntention,
       contextBuilder, sessionManager, scheduler,
     };
@@ -194,7 +203,29 @@ export class BwMem {
       search: (userId, query) => s.facts.searchFacts(userId, query),
       findSimilar: (userId, value, opts) => s.facts.findSimilarActiveFact(userId, value, opts),
       touchMention: (factId) => s.facts.touchFactMention(factId),
-      expireTemporary: () => s.facts.expireTemporaryFacts(),
+      expireTemporary: (untimedMaxAgeDays?: number) =>
+        s.facts.expireTemporaryFacts(untimedMaxAgeDays),
+    };
+  }
+
+  /**
+   * Cross-key collisions: one subject filed under two categories that cannot
+   * both be true, each row internally coherent, so every fact_key-scoped guard
+   * is blind to it.
+   *
+   * Nothing here writes to the facts table. `refresh` raises and closes rows on
+   * its own surface; acting on what it raises is `facts.store` / `facts.remove`,
+   * by the caller's hand.
+   */
+  get collisions(): CollisionsAPI {
+    const s = this.ensureReady();
+    return {
+      refresh: (userId) => s.factCollisions.refresh(userId),
+      list: (userId, includeClosed) => s.factCollisions.list(userId, includeClosed),
+      countOpen: (userId) => s.factCollisions.countOpen(userId),
+      residues: (userId) => s.factCollisions.listDecisionResidues(userId),
+      settle: (userId, subject, note, decidedCategory) =>
+        s.factCollisions.settle(userId, subject, note, decidedCategory),
     };
   }
 
@@ -311,6 +342,34 @@ export class BwMem {
   }
 }
 
+interface CollisionsAPI {
+  /**
+   * Detect, file and close in one pass. Returns what is open afterwards plus
+   * the residue standing against every decision already on record.
+   */
+  refresh(userId: string): Promise<{
+    open: StoredCollision[]; raised: number; resolved: number; residues: DecisionResidue[];
+  }>;
+  list(userId: string, includeClosed?: boolean): Promise<StoredCollision[]>;
+  countOpen(userId: string): Promise<number>;
+  /** Every decision on record, measured against the facts as they are now. */
+  residues(userId: string): Promise<DecisionResidue[]>;
+  /**
+   * Close a collision by recording WHICH SIDE was kept — `decidedCategory` is
+   * required, and that is the point: a settle that records only a note is a
+   * mute. It suppresses the flag while every losing-side row stays active and
+   * retrievable, and because the row's identity is its key list, correcting a
+   * fact afterwards mints a fresh alarm. A decision inverts both: the clash is
+   * never re-raised, and what surfaces instead is the shrinking residue.
+   *
+   * Returns that residue as measured at the moment of settling, so a settle can
+   * no longer quietly hide anything.
+   */
+  settle(
+    userId: string, subject: string, note: string, decidedCategory: string,
+  ): Promise<SettleResult>;
+}
+
 interface FactsAPI {
   get(userId: string, opts?: {
     category?: string;
@@ -339,7 +398,13 @@ interface FactsAPI {
   search(userId: string, query: string): Promise<Fact[]>;
   findSimilar(userId: string, value: string, opts?: { threshold?: number; limit?: number }): Promise<SimilarFactMatch | null>;
   touchMention(factId: string): Promise<void>;
-  expireTemporary(): Promise<number>;
+  /**
+   * Expire temporary facts: those past their valid_until, and those that never
+   * carried one and have gone untended for `untimedMaxAgeDays` (default 30).
+   * The second branch is not optional housekeeping — without it an untimed
+   * temporary never expires at all, and untimed is the common case.
+   */
+  expireTemporary(untimedMaxAgeDays?: number): Promise<number>;
 }
 
 interface EmotionsAPI {

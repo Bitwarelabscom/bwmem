@@ -59,6 +59,7 @@ const TIMEOUT_HIGH_SIMILARITY = 0.95;
 export type ParaphraseGatePath =
   | 'below_floor'
   | 'gate_separate'
+  | 'gate_different_question'
   | 'gate_paraphrase'
   | 'timeout'
   | 'timeout_high_sim'
@@ -180,9 +181,27 @@ export class ParaphraseGate {
         return { paraphrase: false, similarity, path: 'gate_error', reason: '' };
       }
 
-      return verdict.compatible
-        ? { paraphrase: true, similarity, path: 'gate_paraphrase', reason: verdict.reason }
-        : { paraphrase: false, similarity, path: 'gate_separate', reason: verdict.reason };
+      if (verdict.compatible) {
+        return { paraphrase: true, similarity, path: 'gate_paraphrase', reason: verdict.reason };
+      }
+      // 'compatible: false' arrives for two unrelated reasons and only one of
+      // them is a contradiction. When the gate says the new statement answers a
+      // DIFFERENT question than the key asks, nothing has been contradicted —
+      // recording that as a plain separation is what makes a contradiction
+      // count unreadable later. The signal still fires (paraphrase: false, so
+      // the caller's behaviour is unchanged); the path is what carries the
+      // distinction, so a surface can present or discount it knowingly.
+      //
+      // A null separation deliberately falls through to 'gate_separate': the
+      // model not saying which kind it is must never be read as "harmless".
+      return {
+        paraphrase: false,
+        similarity,
+        path: verdict.separation === 'different_question'
+          ? 'gate_different_question'
+          : 'gate_separate',
+        reason: verdict.reason,
+      };
     } catch (error) {
       this.logger.debug('paraphrase gate unavailable, letting signal through', {
         factKey,

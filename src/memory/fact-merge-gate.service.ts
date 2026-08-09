@@ -25,9 +25,31 @@ import type { LLMProvider, Logger } from '../types.js';
  */
 const DEFAULT_TIMEOUT_MS = 12_000;
 
+/**
+ * Why the gate kept two statements apart.
+ *
+ * `compatible: false` has always meant two different things at once, and a
+ * contradiction surface reading only that flag cannot tell them apart:
+ *
+ *  - 'different_question' — the new statement answers something the key never
+ *    asked (a role where the key names a company; a note ABOUT the fact rather
+ *    than an answer to it). Nothing has been contradicted, so raising this to a
+ *    user as a conflict is pure noise.
+ *  - 'conflicting_answer' — both statements answer the question the key names
+ *    and disagree. That is a real value swap, and exactly what a contradiction
+ *    surface exists to catch.
+ *
+ * null means the model did not say, and null must never suppress: an older
+ * model, a truncated reply or a prompt regression must not be able to silence a
+ * contradiction by omission.
+ */
+export type MergeSeparation = 'different_question' | 'conflicting_answer';
+
 export interface MergeGateVerdict {
   compatible: boolean;
   reason: string;
+  /** Only meaningful when `compatible` is false; null when the model didn't say. */
+  separation: MergeSeparation | null;
 }
 
 /**
@@ -49,7 +71,18 @@ const SYSTEM_PROMPT =
   'Decision-relevant differences — different objects, times, scopes, polarity, quantities, or ' +
   'conditions — mean KEEP SEPARATE (compatible: false).\n' +
   'Only say compatible: true when the two are plainly the same claim reworded.\n' +
-  'Reply with JSON only: {"compatible": true|false, "reason": "<one short sentence>"}';
+  'When compatible is false, also name WHICH kind of separation it is, in "separation":\n' +
+  '  "different_question" — the new statement answers something other than the question the key ' +
+  'names, or merely comments on the fact instead of answering it. Nothing is being contradicted.\n' +
+  '  "conflicting_answer" — both statements answer the question the key names, but the answers ' +
+  'cannot both be true: different objects, times, scopes, polarity, quantities or conditions.\n' +
+  'Worked examples: existing company_name / "Acme" vs "member of the dev team at Acme" -> ' +
+  '{"compatible": false, "separation": "different_question"}. Existing esp32_power / "balcony ' +
+  'ESP32 on battery" vs "balcony ESP32 on USB power" -> {"compatible": false, "separation": ' +
+  '"conflicting_answer"}.\n' +
+  'If you cannot tell which, answer "conflicting_answer".\n' +
+  'Reply with JSON only: {"compatible": true|false, "separation": "different_question"|' +
+  '"conflicting_answer"|null, "reason": "<one short sentence>"}';
 
 /**
  * Tolerant JSON extraction. Models wrap answers in prose, fences, and — for
@@ -113,14 +146,24 @@ export class FactMergeGate {
         return { verdict: null, outcome: 'timeout' };
       }
 
-      const parsed = parseGateJson<{ compatible?: unknown; reason?: unknown }>(result);
+      const parsed = parseGateJson<{
+        compatible?: unknown; separation?: unknown; reason?: unknown;
+      }>(result);
       if (!parsed || typeof parsed.compatible !== 'boolean') {
         return { verdict: null, outcome: 'unparseable' };
       }
+      // Only the two exact strings count. A missing, misspelled or invented
+      // value becomes null, and null is read downstream as "say nothing was
+      // ruled out" rather than as "this is only a wording difference".
+      const separation: MergeSeparation | null =
+        parsed.separation === 'different_question' || parsed.separation === 'conflicting_answer'
+          ? parsed.separation
+          : null;
       return {
         verdict: {
           compatible: parsed.compatible,
           reason: typeof parsed.reason === 'string' ? parsed.reason.slice(0, 300) : '',
+          separation,
         },
         outcome: 'ok',
       };

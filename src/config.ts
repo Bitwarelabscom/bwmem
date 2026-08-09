@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { BwMemConfig, Logger } from './types.js';
+import { DEFAULT_EXCLUSIVE_FAMILIES } from './memory/fact-collision.service.js';
 
 const DEFAULT_TABLE_PREFIX = 'bwmem_';
 const DEFAULT_INACTIVITY_TIMEOUT_MS = 300_000; // 5 minutes
@@ -33,6 +34,8 @@ export interface ResolvedConfig {
   inlineContradictions: boolean;
   /** Timeline extraction at consolidation. Off unless asked for. */
   temporalIndex: boolean;
+  /** Mutually exclusive category axes for the cross-key collision check. */
+  exclusiveFamilies: import('./memory/fact-collision.service.js').ExclusiveFamily[];
   logger: Logger;
 }
 
@@ -79,6 +82,7 @@ export function resolveConfig(input: BwMemConfig): ResolvedConfig {
     factKeyMerge: input.factKeyMerge !== false,
     inlineContradictions: input.inlineContradictions === true,
     temporalIndex: input.temporalIndex === true,
+    exclusiveFamilies: input.exclusiveFamilies ?? DEFAULT_EXCLUSIVE_FAMILIES,
     session: {
       inactivityTimeoutMs: input.session?.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS,
     },

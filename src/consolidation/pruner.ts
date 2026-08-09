@@ -62,8 +62,23 @@ export class Pruner {
     }
   }
 
-  /** Expire temporary facts past their valid_until date. */
-  async expireTemporaryFacts(): Promise<number> {
+  /**
+   * Expire temporary facts: those past their valid_until, and those that never
+   * had one and have gone untended for `untimedMaxAgeDays`.
+   *
+   * The second branch used to be missing, which made an untimed temporary
+   * immortal — see FactsService.expireTemporaryFacts for the full account of
+   * why untimed temporaries are the common case rather than the exception.
+   * Age is COALESCE(last_mentioned, updated_at, created_at), so a state still
+   * being re-asserted stays live.
+   *
+   * @param untimedMaxAgeDays days untended before an untimed temporary ages
+   *        out. Pass Infinity to keep the old valid_until-only behaviour.
+   */
+  async expireTemporaryFacts(untimedMaxAgeDays = 30): Promise<number> {
+    const untimed = Number.isFinite(untimedMaxAgeDays) && untimedMaxAgeDays > 0
+      ? Math.round(untimedMaxAgeDays)
+      : null;
     try {
       const result = await this.pg.query<{ count: string }>(
         `WITH expired AS (
@@ -71,11 +86,15 @@ export class Pruner {
            SET fact_status = 'expired', updated_at = NOW()
            WHERE fact_type = 'temporary'
              AND fact_status = 'active'
-             AND valid_until IS NOT NULL
-             AND valid_until <= NOW()
+             AND ( (valid_until IS NOT NULL AND valid_until <= NOW())
+                   OR ($1::int IS NOT NULL
+                       AND valid_until IS NULL
+                       AND COALESCE(last_mentioned, updated_at, created_at)
+                           <= NOW() - ($1::int * interval '1 day')) )
            RETURNING id
          )
-         SELECT COUNT(*) as count FROM expired`
+         SELECT COUNT(*) as count FROM expired`,
+        [untimed]
       );
       const count = parseInt(result[0]?.count ?? '0', 10);
       if (count > 0) {
