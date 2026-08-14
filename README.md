@@ -10,20 +10,29 @@ Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: bi-tempo
 
 Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, response quality scoring, and long-term memory consolidation in the background.
 
-**v0.5.1 — upgrade if you pass `intentId` anywhere.** `facts.get()` treated an
-absent intent as *"return only unscoped facts"*, and `buildContext()` calls it that
-way with no option to do otherwise. Any fact written via `store({ intentId })` was
-therefore unreachable from the context the SDK exists to build — silently, with no
-error. Intent is now a **ranking preference** (the given intent first, then unscoped,
-then the rest) rather than a filter, and one fact key resolves to one winner across
-intents instead of competing rows. Passing `intentId: null` still means
-"unscoped only" if you were relying on that. Also adds `queryText` / `facts.searchRelevant()`:
-the `limit` window is ordered by mention count and is otherwise identical on every
-turn, so a fact mentioned once or twice could never surface however relevant it was —
-matches on the current message are now appended to it (additive; the core set is never
-displaced). Run migration 015.
+**v0.9.1 — retrieval defaults are now the measured best, and four features that
+looked finished were not.** Building a benchmark harness that drives this package
+through its own public API surfaced things no amount of reading the code would
+have: the temporal index had **no write path at all**, so `[Timeline]` could only
+ever render nothing; every timeline date was **one day early**; every message was
+**embedded twice**; and `recordMessage` could not carry a timestamp, so importing
+history collapsed a whole corpus onto the import instant.
 
-**v0.5.0** adds same-claim merge gates on both the key and value axes, contradiction signals that count the disagreement rather than the mentions, a timeline index for ordering questions, and a per-channel session texture. It also fixes two defects in earlier releases: a dedup scope that produced duplicate active facts, and an inline contradiction scan that over-fired.
+Also in this line: retrieval defaults set to the configuration that scored highest
+on LongMemEval rather than to cautious round numbers (recall depth 5 → 25, cosine
+floor 0.25 → 0.5, the hardcoded 300-character clip off), and a `bulkImport` session
+mode for backfilling history that cuts LLM calls per message roughly 4×.
+
+Run migration 017. See [What's new in 0.9.0](#whats-new-in-090),
+[0.8.0](#whats-new-in-080) and [0.7.0](#whats-new-in-070).
+
+**Earlier:** 0.7.0 gave contradictions a lifecycle they can actually leave and made
+truncated LLM output an error rather than a silently-parsed prefix. 0.6.0 added
+cross-key collision detection and made `temporary` facts actually expire. 0.5.x
+added same-claim merge gates on the key and value axes, contradiction signals that
+count the disagreement rather than the mentions, a timeline index, and per-channel
+session texture — and fixed intent scoping, which was a filter that silently hid
+every scoped fact from the context the SDK exists to build.
 
 ## Features
 
@@ -35,6 +44,8 @@ displaced). Run migration 015.
 - **Emotional capture** — detects high-emotion moments using VAD (Valence-Arousal-Dominance) analysis with specific descriptive tags
 - **Contradiction detection** — both async (on fact supersession) and **inline** (real-time, zero-I/O scan during message ingestion), with stopword and volatile-key filtering to dampen false positives
 - **Contradiction lifecycle** — open / held / resolved, where a resolve must name which value won and a hold lapses when the underlying fact moves. Replaces a display flag that no code path could ever turn into a resolution (0.7.0)
+- **Benchmarked retrieval defaults** — recall depth, cosine floor, clipping and ordering are set to the configuration that scored highest on LongMemEval, not to cautious round numbers. All overridable per call (0.8.0)
+- **Bulk import** — `startSession({ bulkImport: true })` for backfilling existing history: ~4x fewer LLM calls per message, with per-turn timestamps so imported conversations keep their real dates (0.9.0)
 - **Truncation is an error** — providers read `finish_reason` and refuse to hand back a cut-off completion, instead of returning a prefix that regex-and-`JSON.parse` will happily store as a finished answer (0.7.0)
 - **Quality scoring** — per-response scoring split into `output_integrity` (the agent's own quality: relevance, coherence, memory fidelity, generativity, completeness) and `interaction_vitality` (engagement: reply speed, length, feedback class). Engagement noise no longer drags down the agent's self-score.
 - **Session texture** — captures the *throughline* (what was being worked through) and *emotional register* of a session at close; surfaces as an anchor on the next session in the same (mode, speaker) pair. Hands the next session momentum, not just facts.
@@ -60,12 +71,23 @@ long-term-memory benchmark.
 |---|---|---|---|
 | **bwmem's parent stack** | deepseek-v4-pro | 25 | **81.7%** |
 | **bwmem's parent stack** | gpt-4o | 25 | **78.3%** |
-| **bwmem's parent stack** | deepseek-v4-flash | 25 | **70.0%** |
+| **bwmem's parent stack** | deepseek-v4-flash | 25 | **70.0%** † |
 | bwmem's parent stack | gpt-4o | 8 | 65.0% |
 | bwmem's parent stack | deepseek-v4-flash | 8 | 60.0% |
 | Zep *(self-reported)* | — | — | 63.8–71.2% |
 | Full-context gpt-4o *(published)* | — | — | ~60% |
 | mem0 *(self-reported)* | — | — | ~49% |
+
+**† That 70.0% is wrong, and it is wrong in our favour to leave uncorrected.**
+Re-examining the run, **8 of 60 answers came back completely empty** and all 8 were
+judged incorrect. Over the answers the model actually produced the score is
+**42/52 = 80.8%**. The cause was the harness, not the memory layer: it capped
+answers at 300 tokens and discarded `finish_reason`, and deepseek-v4-flash is
+reasoning-first — reasoning tokens are emitted before any content and consume the
+same budget, so the reader spent the cap thinking and returned nothing. The empty
+responses were still billed. The other two readers had zero empties, which is why
+only this row looked bad. The harness now escalates the cap and reports empty and
+truncated counts separately from the score.
 
 Run conditions: a 60-question stratified subset of LongMemEval_S (cleaned), judged
 by the official `gpt-4o-2024-08-06` judge, seed `20260803`. That is **not** the
@@ -168,6 +190,76 @@ await mem.textures.capture(session.id); // anchor for the next session
 
 await mem.shutdown();
 ```
+
+## What's new in 0.9.0
+
+### `bulkImport` — backfilling history is a different shape from a live chat
+
+The per-message pipeline assumes a live conversation, where one extra LLM call per
+turn is invisible. Importing a corpus runs that same work thousands of times in a
+burst, and then the LLM calls — not the database — set the wall clock. Measured
+against LongMemEval, a live-mode import ran at **0.42 messages/sec**, about six days
+for that corpus.
+
+```typescript
+const session = await mem.startSession({ userId, bulkImport: true });
+```
+
+| kept | skipped |
+|---|---|
+| embeddings, session centroid, fact extraction, direct-correction contradiction signals, end-of-session episodic + temporal passes | per-message sentiment, emotional-moment capture, LLM behavioural contradiction detection |
+
+Roughly a **4× cut in LLM calls per message** (measured 0.42 → 3.20 msg/s on the
+same corpus and hardware). Sentiment is the one that matters: it ran on *every*
+message and nothing in retrieval reads it — it exists to gate emotional-moment
+capture, which an import skips too.
+
+The cost, stated rather than buried: imported messages carry no sentiment scores and
+record no emotional moments, so a context built over import-only history has an empty
+"Recent Emotional Moments" block. That is the right trade for a backfill and the
+wrong one for a live session, which is why it is per-session and defaults to `false`.
+
+### Messages can carry their own timestamp
+
+```typescript
+await session.recordMessage({ role: 'user', content: '...', timestamp: '2023-05-14T09:30:00Z' });
+```
+
+Required for importing history. Without it every backfilled message is dated at
+import time, which collapses the corpus onto one instant — recall ordering, the
+timeline, and every "when did I…" question then answer about the import run rather
+than about the conversation.
+
+### The temporal index had no write path
+
+`extract()` and `store()` were public methods on the temporal service and **nothing
+in the package called either one**. `temporal_events` stayed empty forever, so the
+`[Timeline]` block could only ever render nothing. The feature was configurable,
+documented, and structurally inert. Events are now extracted on `session.end()`, and
+`temporalIndex` defaults to **on** — opt-in to a feature with no write path was a
+distinction without a difference.
+
+### Timeline dates were all one day early
+
+`occurred_on` is a `DATE`. node-postgres parses `DATE` to *local* midnight, and the
+renderer did `new Date(...).toISOString().slice(0,10)`, which converts to UTC — so
+anywhere east of Greenwich every event displayed one day before the date actually
+stored. The database was right and the prompt was wrong. Rendered with `to_char` in
+SQL now.
+
+### Every message was embedded twice
+
+`storeMessageEmbedding()` generated an embedding and returned `void`; the next
+statement called `generate()` again on the identical string to update the session
+centroid. Two paid embeddings per message to recompute a value already in hand.
+
+### Fact extraction had an unbounded input (0.9.1)
+
+The prompt asks for *all* facts, so output length tracks input length — and the input
+was every user message in the batch, joined, at any size. On a corpus with long turns
+that produced 28,000 characters of JSON against an 8,000-token ceiling and truncated
+every time. Raising the cap cannot fix an unbounded input; the input is now bounded
+too (12,000 characters, newest kept).
 
 ## What's new in 0.8.0
 
