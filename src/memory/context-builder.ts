@@ -9,6 +9,8 @@ import type { SelfIntentionService } from './self-intention.service.js';
 import type { TemporalEventsService } from './temporal-events.service.js';
 import type { GraphPlugin, Logger, MemoryContext, BuildContextOptions, EpisodicPattern, SemanticEntry } from '../types.js';
 import { safeQuery } from '../utils/safe-query.js';
+import { classifyRetrieval } from './retrieval-profile.js';
+import { fuseByRank } from './rank-fusion.js';
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
@@ -81,8 +83,20 @@ export class ContextBuilder {
     const speaker = options?.speaker;
     const includeSessionTexture = options?.includeSessionTexture !== false;
     const includeIntention = options?.includeIntentionPrompt === true;
-    const recallK = options?.maxSimilarMessages ?? DEFAULT_RECALL_K;
-    const threshold = options?.similarityThreshold ?? DEFAULT_SIMILARITY_THRESHOLD;
+    // Retrieval depth is chosen from the question unless the caller overrides
+    // it. A fixed depth is wrong for half the workload in opposite directions:
+    // widening is worth +31 points on multi-session questions and costs 12 on
+    // temporal ones. See retrieval-profile.ts for the measurements.
+    const profile = query && options?.adaptiveRetrieval === true
+      ? classifyRetrieval(query)
+      : null;
+    const recallK = options?.maxSimilarMessages ?? profile?.limit ?? DEFAULT_RECALL_K;
+    const threshold = options?.similarityThreshold ?? profile?.threshold ?? DEFAULT_SIMILARITY_THRESHOLD;
+    if (profile) {
+      this.logger.debug('retrieval profile', {
+        intent: profile.intent, reason: profile.reason, k: recallK, threshold,
+      });
+    }
     const includeTimeline = options?.includeTimeline !== false;
     const expandSessions = options?.expandSessions ?? 0;
 
@@ -97,7 +111,8 @@ export class ContextBuilder {
         userId, undefined, options?.maxFacts ?? 30, undefined, query,
       ), [], timeout, this.logger),
       safeQuery('similarMessages', query
-        ? this.recallMessages(userId, query, recallK, threshold, sessionId, expandSessions)
+        ? this.recallMessages(userId, query, recallK, threshold, sessionId, expandSessions,
+                              options?.keywordRecall === true)
         : Promise.resolve([]), [], timeout, this.logger),
       safeQuery('similarConversations', query
         ? this.embedding.searchSimilarConversations(userId, query, 3)
@@ -107,7 +122,14 @@ export class ContextBuilder {
       safeQuery('behavioral', this.behavioral.getActive(userId, 5), [], timeout, this.logger),
       safeQuery('episodic', this.getEpisodicPatterns(userId), [], timeout, this.logger),
       safeQuery('semantic', this.getSemanticKnowledge(userId), [], timeout, this.logger),
-      safeQuery('graph', this.graph ? this.graph.getContext(userId) : Promise.resolve(null), null, timeout, this.logger),
+      // Entity arm. Query-scoped when the plugin supports it, falling back to
+      // the user-scoped blob — getContext returns the same thing whatever is
+      // asked, which makes it a preamble rather than a retrieval signal.
+      safeQuery('graph', this.graph
+        ? (query && this.graph.searchEntities
+            ? this.graph.searchEntities(userId, query).then(r => r ?? this.graph!.getContext(userId))
+            : this.graph.getContext(userId))
+        : Promise.resolve(null), null, timeout, this.logger),
       safeQuery('sessionTexture', includeSessionTexture
         ? this.sessionTexture.getForPrompt(userId, { mode, speaker })
         : Promise.resolve(''), '', timeout, this.logger),
@@ -167,6 +189,7 @@ export class ContextBuilder {
       sessionTexture: textureBlock || undefined,
       intentionPrompt: intentionBlock || undefined,
       timeline: timelineBlock || undefined,
+      retrievalProfile: profile ?? undefined,
       formatted,
       sourcesResponded: `${responded}/${total}`,
     };
@@ -185,10 +208,31 @@ export class ContextBuilder {
   private async recallMessages(
     userId: string, query: string, limit: number, threshold: number,
     excludeSessionId: string | undefined, expandSessions: number,
+    keywordRecall: boolean,
   ): Promise<Awaited<ReturnType<EmbeddingService['searchSimilarMessages']>>> {
-    const hits = await this.embedding.searchSimilarMessages(
-      userId, query, limit, threshold, excludeSessionId,
-    );
+    // Hybrid: vector and keyword arms run concurrently and are fused by RANK.
+    //
+    // Vector-only recall was the root of the precision/recall bind — tighten
+    // the cosine floor and multi-session questions starve, loosen it and
+    // single-turn questions drown. Both arms of that trade come from ranking on
+    // one signal. Keyword recall catches what embeddings are worst at: rare
+    // literal tokens, proper nouns, model numbers, coined spellings.
+    //
+    // The keyword arm is additive and failure-isolated — it returns [] on any
+    // error, which degrades to exactly the previous vector-only behaviour.
+    const [vectorHits, keywordHits] = await Promise.all([
+      this.embedding.searchSimilarMessages(userId, query, limit, threshold, excludeSessionId),
+      keywordRecall
+        ? this.embedding.searchMessagesByKeyword(userId, query, limit, excludeSessionId)
+        : Promise.resolve([]),
+    ]);
+
+    // Vector arm first: it decides ties, and it carries the real similarity
+    // scores that the prompt renders.
+    const hits = keywordHits.length > 0
+      ? fuseByRank([{ items: vectorHits }, { items: keywordHits }], limit)
+      : vectorHits;
+
     if (expandSessions <= 0 || hits.length === 0) return hits;
 
     // Session order follows hit rank, so truncating keeps the best sessions.

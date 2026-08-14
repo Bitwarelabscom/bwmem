@@ -121,6 +121,22 @@ export interface GraphPlugin {
   syncEntity(userId: string, entity: EntityNode, ctx?: GraphPluginContext): Promise<void>;
   getContext(userId: string, ctx?: GraphPluginContext): Promise<string | null>;
   getStats(userId: string, ctx?: GraphPluginContext): Promise<GraphStats | null>;
+  /**
+   * Entities relevant to THIS query, with their immediate neighbourhood.
+   *
+   * `getContext` is user-scoped: it returns the same graph blob whatever is
+   * being asked, which makes it a static preamble rather than a retrieval
+   * signal. This is the query-scoped counterpart — the entity arm of hybrid
+   * recall, answering "who and what is this question about, and what is
+   * connected to them".
+   *
+   * OPTIONAL so that plugins written against the earlier interface keep
+   * compiling and working. A plugin that does not implement it simply
+   * contributes no entity signal.
+   */
+  searchEntities?(
+    userId: string, query: string, limit?: number, ctx?: GraphPluginContext,
+  ): Promise<string | null>;
 }
 
 export interface Logger {
@@ -437,6 +453,8 @@ export interface MemoryContext {
    * temporal, so absence is the normal case, not a failure.
    */
   timeline?: string;
+  /** Which retrieval profile the query selected, and why. Absent if overridden or disabled. */
+  retrievalProfile?: import('./memory/retrieval-profile.js').RetrievalProfile;
   formatted: string;
   sourcesResponded: string;
 }
@@ -492,6 +510,58 @@ export interface BuildContextOptions {
    * that need it. Requires `temporalIndex` to be enabled.
    */
   includeTimeline?: boolean;
+  /**
+   * Choose recall depth from the question instead of using one fixed setting.
+   * Default **false**.
+   *
+   * It was built on a real-looking signal and did not survive measurement.
+   * Per-category results from a single run said temporal questions wanted a
+   * tight net (81.2%) and multi-session ones wanted a wide one (37.5% -> 68.8%),
+   * which implied ~81.7% for a perfect router. Re-running the SAME configs
+   * moved those same categories by 12-22 points — the categories hold 4 to 16
+   * questions each, and the signal was inside the noise.
+   *
+   * End to end, routing scored 70.0% against 70.0% for a fixed tight net and
+   * 73.3% for a fixed wide one. It bought nothing.
+   *
+   * Kept, off, and documented rather than deleted: the classifier is sound and
+   * costs no LLM call, and on a corpus where the question mix genuinely differs
+   * it may pay. An explicit `maxSimilarMessages` or `similarityThreshold`
+   * always wins over it.
+   */
+  adaptiveRetrieval?: boolean;
+  /**
+   * Run the keyword arm alongside the vector arm and fuse by rank.
+   * Default **false** — see the measurement below before turning it on.
+   *
+   * Embeddings are good at topic and bad at rare literal tokens — a proper
+   * noun, a model number, a spelling the user coined once. Keyword recall
+   * catches exactly those. Fusion is reciprocal-rank, not score-based, because
+   * `ts_rank` has no fixed range and a tuned absolute floor works on one corpus
+   * and fails silently on another.
+   *
+   * MEASURED WORSE AS SHIPPED, which is why it is off. On a 60-question
+   * LongMemEval subset it cost points at both widths:
+   *
+   *   tight  70.0% -> 66.7%   (context 12.8k -> 47.6k chars)
+   *   wide   73.3% -> 58.3%   (context 127k  -> 214k chars)
+   *
+   * The reason is a flaw in this arm, not in hybrid search as an idea. The
+   * query is OR'd across up to 25 terms with no relevance floor, so a question
+   * mentioning "train", "airport" and "hotel" matches a large, weakly-related
+   * slice of the corpus — and because fusion works on RANK, those rows enter
+   * the fused top-N and displace rows the vector arm had ranked well. It is
+   * behaving as a recall device where it was meant to be a precision one.
+   *
+   * Left in and documented rather than deleted: hybrid retrieval is standard
+   * practice and the fix is a bounded, higher-precision keyword arm (fewer and
+   * rarer terms, a contribution cap, a lower fusion weight) rather than an
+   * abandonment. Turn it on only with your own measurement.
+   *
+   * Requires migration 018. Fails soft: if the keyword arm errors, recall
+   * degrades to vector-only rather than failing the read.
+   */
+  keywordRecall?: boolean;
   /**
    * Pull every message from the sessions the top hits landed in.
    * Default **false**, and the default is a measured result, not caution.

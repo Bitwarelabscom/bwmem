@@ -221,6 +221,65 @@ await mem.textures.capture(session.id); // anchor for the next session
 await mem.shutdown();
 ```
 
+## What's new in 0.10.0
+
+### Three retrieval ideas, measured, and two of them did not work
+
+All on the same 60-question LongMemEval subset, same corpus, same reader, with
+the reader's reasoning disabled so no answer is lost to a token cap:
+
+| config | score | mean context |
+|---|---|---|
+| vector, tight (k=25, floor 0.5) | **70.0%** | 12.8k chars |
+| vector, wide (k=200, floor 0.35) | **73.3%** | 127k chars |
+| query-adaptive depth | 70.0% | 50.6k chars |
+| hybrid keyword, tight | 66.7% | 47.6k chars |
+| hybrid keyword, wide | 58.3% | 214k chars |
+
+`keywordRecall` and `adaptiveRetrieval` are therefore **off by default**. Both
+are implemented, tested and documented — the code is there and you can turn it
+on — but shipping a default that measures worse is how the 300-character clip
+and the 0.5 floor got there in the first place.
+
+The 3.3 points between tight and wide is two questions, inside the ±2 error
+bar, for **ten times the context and token bill**. That is not a good trade, so
+the tight default stands.
+
+### Keyword search over messages (migration 018, opt-in)
+
+Messages had no full-text index; facts have had one since 0.5.0. There is a GIN
+index now, an OR'd-terms keyword arm, and reciprocal-rank fusion.
+
+Fusion is by **rank, not score**, deliberately. Cosine similarity sits in a
+narrow model-dependent band and `ts_rank` has no fixed range at all — it scales
+with document length. Combining them numerically produces something calibrated
+to one corpus that fails silently on another. RRF uses only order, so nothing
+needs per-corpus tuning.
+
+It still measured worse, and the reason is this arm rather than the idea: it
+ORs up to 25 terms with no relevance floor, so a question naming "train",
+"airport" and "hotel" matches a large weakly-related slice, and rank fusion then
+promotes that into the top-N where it displaces rows the vector arm ranked well.
+It behaves as a recall device where it was meant to be a precision one. The fix
+is a bounded, higher-precision arm — fewer and rarer terms, a contribution cap,
+a lower fusion weight — not abandonment.
+
+### Query-scoped entity search on the graph plugin (opt-in)
+
+`GraphPlugin.getContext(userId)` is user-scoped: it returns the same graph blob
+whatever the question, which makes it a preamble rather than a retrieval signal.
+`searchEntities(userId, query)` is the query-scoped counterpart — optional on the
+interface, so plugins written against the old one keep working.
+
+It matches query tokens against entity labels **case-insensitively rather than by
+embedding**: entity labels are short proper nouns, exactly the class where
+vectors are weakest. Embedding "Biscuit" to find the dog named Biscuit is the
+wrong tool. One hop out, not a full traversal — two hops on a connected graph
+returns most of it and you are back to a preamble.
+
+Implemented for Neo4j and unit-tested; **not yet measured end to end**, because
+the benchmark stack runs without a graph instance.
+
 ## What's new in 0.9.0
 
 ### `bulkImport` — backfilling history is a different shape from a live chat

@@ -87,6 +87,69 @@ export class Neo4jGraph implements GraphPlugin {
     }
   }
 
+  /**
+   * Entity arm of hybrid recall: entities named by the query, plus what they
+   * are connected to.
+   *
+   * The query is tokenised and matched case-insensitively against entity
+   * labels rather than embedded. Entity labels are short proper nouns, which is
+   * precisely the class where a vector match is weakest and an exact string
+   * match is strongest — embedding "Biscuit" to find the dog named Biscuit is
+   * the wrong tool.
+   *
+   * One hop out, not a full traversal. Two hops on a well-connected graph
+   * returns most of it, which is a preamble again rather than a signal.
+   */
+  async searchEntities(
+    userId: string, query: string, limit = 10, _ctx?: GraphPluginContext,
+  ): Promise<string | null> {
+    const terms = Array.from(new Set(
+      (query.match(/[a-zA-Zà-ÿ0-9]{3,}/g) ?? []).map(t => t.toLowerCase()),
+    )).slice(0, 25);
+    if (terms.length === 0) return null;
+
+    try {
+      const rows = await this.client.readQuery<{
+        label: string; type: string; neighbour: string | null;
+        rel: string | null; weight: number | null;
+      }>(
+        `MATCH (e:BwMemEntity {userId: $userId})
+          WHERE toLower(e.label) IN $terms
+             OR ANY(t IN $terms WHERE toLower(e.label) CONTAINS t)
+         OPTIONAL MATCH (e)-[r]-(n:BwMemEntity {userId: $userId})
+         WITH e, n, r
+         ORDER BY COALESCE(r.weight, 0) DESC
+         RETURN e.label AS label, e.type AS type,
+                n.label AS neighbour, type(r) AS rel, r.weight AS weight
+         LIMIT $limit`,
+        { userId, terms, limit },
+      );
+      if (rows.length === 0) return null;
+
+      // Grouped by entity so the block reads as "this thing, and what it is
+      // connected to" rather than a flat edge list.
+      const byEntity = new Map<string, { type: string; links: string[] }>();
+      for (const r of rows) {
+        const entry = byEntity.get(r.label) ?? { type: r.type, links: [] };
+        if (r.neighbour && r.rel) {
+          entry.links.push(`${r.rel.toLowerCase().replace(/_/g, ' ')} ${r.neighbour}`);
+        }
+        byEntity.set(r.label, entry);
+      }
+
+      const lines = Array.from(byEntity.entries()).map(([label, e]) =>
+        e.links.length > 0
+          ? `- ${label} (${e.type}): ${e.links.slice(0, 5).join('; ')}`
+          : `- ${label} (${e.type})`);
+
+      return `[Entities]\n${lines.join('\n')}`;
+    } catch (error) {
+      // An arm, not the whole of retrieval: degrade rather than fail the read.
+      this.logger.warn('searchEntities failed', { error: (error as Error).message });
+      return null;
+    }
+  }
+
   /** Record a co-occurrence between two entities. */
   async recordCooccurrence(userId: string, entity1: string, entity2: string): Promise<void> {
     await entityGraph.recordCooccurrence(this.client, userId, entity1, entity2, this.logger);

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { PgClient } from '../db/postgres.js';
 import type { EmbeddingProvider, Logger, SimilarMessage, SimilarConversation } from '../types.js';
+import { messageToOrQuery } from './facts.service.js';
 
 interface CacheEntry {
   embedding: number[];
@@ -191,6 +192,64 @@ export class EmbeddingService {
       }));
     } catch (error) {
       this.logger.error('messagesInSessions failed', { error: (error as Error).message });
+      return [];
+    }
+  }
+
+  /**
+   * Keyword arm of hybrid recall: BM25-ish ranking over message text.
+   *
+   * Exists because embeddings are good at topic and bad at rare literal tokens.
+   * A question naming a proper noun, a model number or a coined spelling is
+   * exactly where cosine similarity returns "things that feel related" and a
+   * lexical match returns the row.
+   *
+   * OR'd terms via {@link messageToOrQuery}, not `plainto_tsquery`, which ANDs:
+   * requiring every word of a question to appear in one message matches almost
+   * nothing.
+   *
+   * Returns `similarity: 0` — these rows were ranked lexically, and reporting a
+   * cosine score for them would be inventing a number. Rank order is what the
+   * fusion step consumes.
+   */
+  async searchMessagesByKeyword(
+    userId: string, query: string, limit = 25, excludeSessionId?: string,
+  ): Promise<SimilarMessage[]> {
+    const tsq = messageToOrQuery(query);
+    if (!tsq) return [];
+
+    try {
+      const params: unknown[] = [userId, tsq];
+      // to_tsvector('english', content) verbatim — migration 018's GIN index is
+      // on this exact expression and any variation silently drops to a seq scan.
+      let sql = `
+        SELECT id, session_id, content, role, 0 AS similarity, created_at,
+               ts_rank(to_tsvector('english', content), to_tsquery('english', $2)) AS rank
+          FROM ${this.prefix}messages
+         WHERE user_id = $1
+           AND content IS NOT NULL AND content <> ''
+           AND to_tsvector('english', content) @@ to_tsquery('english', $2)
+      `;
+      if (excludeSessionId) {
+        sql += ` AND session_id != $${params.length + 1}`;
+        params.push(excludeSessionId);
+      }
+      sql += ` ORDER BY rank DESC LIMIT $${params.length + 1}`;
+      params.push(limit);
+
+      const rows = await this.pg.query<SimilarMessageRow>(sql, params);
+      return rows.map(row => ({
+        messageId: row.id,
+        sessionId: row.session_id,
+        content: row.content,
+        role: row.role,
+        similarity: 0,
+        createdAt: row.created_at,
+      }));
+    } catch (error) {
+      // Keyword recall is an ARM of hybrid search, not the whole of it. A
+      // failure here must degrade to vector-only rather than fail the read.
+      this.logger.warn('searchMessagesByKeyword failed', { error: (error as Error).message });
       return [];
     }
   }
