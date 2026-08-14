@@ -184,6 +184,21 @@ function cosineSimilarity(a: number[], b: number[]): number {
  */
 const MAX_EXTRACTION_INPUT_CHARS = 12000;
 
+/**
+ * Ceiling on the number of facts one extraction may return.
+ *
+ * "Extract ALL facts — thoroughness matters more than brevity" is an invitation
+ * to generate without limit, and on a dense corpus the model accepted it: 18% of
+ * extraction batches ran to the token cap and were discarded, up to 48,000
+ * characters of JSON at a time. Bounding the INPUT was not enough, because the
+ * instruction bounded nothing about the OUTPUT. A prompt that cannot say "stop"
+ * needs a number in it.
+ *
+ * Ordered most-important-first so the ceiling truncates the tail rather than an
+ * arbitrary slice.
+ */
+const MAX_FACTS_PER_EXTRACTION = 25;
+
 export class FactsService {
   private pg: PgClient;
   private llm: LLMProvider;
@@ -767,7 +782,7 @@ Lifecycle:
 - Temporary/evolving states (moods, situations, plans): set "factType": "temporary"
 - Default to "permanent"
 
-Output a JSON array. Extract ALL facts — thoroughness matters more than brevity:
+Output a JSON array of AT MOST ${MAX_FACTS_PER_EXTRACTION} facts, most important first. Be thorough within that ceiling:
 [{"category": "personal", "factKey": "name", "factValue": "John", "confidence": 1.0, "isCorrection": false, "factType": "permanent"}]
 
 Return [] if no facts found.`;
@@ -818,6 +833,16 @@ Return [] if no facts found.`;
       }
 
       return facts.filter(f => {
+        // TYPE, not just truthiness. This checked only that the fields were
+        // present, so a model answering `"factValue": 35` for an age — an
+        // unquoted number, which is a completely reasonable thing for it to
+        // emit — passed validation and then threw
+        // `b.toLowerCase is not a function` deep inside dedup, several steps
+        // away from the actual cause. Numbers are coerced because a numeric
+        // value is a legitimate fact; anything else is rejected.
+        if (typeof f.factValue === 'number') f.factValue = String(f.factValue);
+        if (typeof f.category !== 'string' || typeof f.factKey !== 'string'
+            || typeof f.factValue !== 'string') return false;
         if (!f.category || !f.factKey || !f.factValue || typeof f.confidence !== 'number') return false;
         if (isSpeculativeFact(f.factValue)) {
           this.logger.warn('Rejected speculative fact', { key: f.factKey });

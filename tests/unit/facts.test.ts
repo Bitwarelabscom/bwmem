@@ -241,6 +241,45 @@ describe('FactsService', () => {
       expect(pg.lastParams).toContain('%hiking%');
     });
   });
+
+  describe('extracted-fact validation', () => {
+    it('coerces a numeric factValue instead of crashing dedup', async () => {
+      // A model answering `"factValue": 35` for an age is reasonable JSON, and
+      // the old truthiness-only check let it through — then dedup threw
+      // `b.toLowerCase is not a function` several steps away from the cause.
+      llm.respond(JSON.stringify([{
+        category: 'personal', factKey: 'age', factValue: 35,
+        confidence: 0.9, isCorrection: false, factType: 'permanent',
+      }]));
+      pg.willReturn([]);
+      const out = await facts.extractFromMessages(
+        [{ role: 'user', content: 'I am thirty five years old now.' }], 'user-1');
+      expect(out).toHaveLength(1);
+      expect(out[0].factValue).toBe('35');
+    });
+
+    it('rejects a non-string, non-numeric factValue', async () => {
+      llm.respond(JSON.stringify([{
+        category: 'personal', factKey: 'pets', factValue: { name: 'Biscuit' },
+        confidence: 0.9, isCorrection: false, factType: 'permanent',
+      }]));
+      pg.willReturn([]);
+      const out = await facts.extractFromMessages(
+        [{ role: 'user', content: 'I have a dog called Biscuit at home.' }], 'user-1');
+      expect(out).toHaveLength(0);
+    });
+
+    it('asks for a bounded number of facts', async () => {
+      // The prompt used to say "extract ALL facts, thoroughness over brevity",
+      // which bounded nothing: 18% of batches ran to the token cap and were
+      // discarded whole.
+      llm.respond('[]');
+      pg.willReturn([]);
+      await facts.extractFromMessages(
+        [{ role: 'user', content: 'Something reasonably long to extract from.' }], 'user-1');
+      expect(llm.lastSystemPrompt).toContain('AT MOST 25 facts');
+    });
+  });
 });
 
 function makeFact(overrides: Partial<import('../../src/types.js').Fact> = {}): import('../../src/types.js').Fact {
