@@ -31,6 +31,8 @@ const DEFAULT_RECALL_K = 25;
 const DEFAULT_SIMILARITY_THRESHOLD = 0.5;
 /** 0 = do not truncate. */
 const DEFAULT_CLIP_CHARS = 0;
+/** Fusion weight for the keyword arm. Below 1 on purpose — see recallMessages. */
+const KEYWORD_ARM_WEIGHT = 0.5;
 
 export class ContextBuilder {
   private pg: PgClient;
@@ -229,8 +231,15 @@ export class ContextBuilder {
 
     // Vector arm first: it decides ties, and it carries the real similarity
     // scores that the prompt renders.
+    // Keyword arm weighted below the vector arm. It is a supplement for rare
+    // literal tokens, not a co-equal channel: at weight 1 a row only IT liked
+    // could outrank one both arms liked, which is how the first version
+    // displaced good rows out of the fused top-N.
     const hits = keywordHits.length > 0
-      ? fuseByRank([{ items: vectorHits }, { items: keywordHits }], limit)
+      ? fuseByRank(
+          [{ items: vectorHits, weight: 1 }, { items: keywordHits, weight: KEYWORD_ARM_WEIGHT }],
+          limit,
+        )
       : vectorHits;
 
     if (expandSessions <= 0 || hits.length === 0) return hits;

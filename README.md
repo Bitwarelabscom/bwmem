@@ -69,7 +69,8 @@ long-term-memory benchmark.
 
 | System | Reader | k | Score |
 |---|---|---|---|
-| **bwmem (this package)** | deepseek-v4-flash-0731 | 25 | **71.7%** ‡ |
+| **bwmem (this package)** | deepseek-v4-pro | 25 | **77.5%** ‡ |
+| **bwmem (this package)** | deepseek-v4-flash-0731 | 25 | **69.0%** ‡ |
 | **bwmem's parent stack** | deepseek-v4-pro | 25 | **81.7%** |
 | **bwmem's parent stack** | gpt-4o | 25 | **78.3%** |
 | **bwmem's parent stack** | deepseek-v4-flash | 25 | **70.0%** † |
@@ -79,17 +80,49 @@ long-term-memory benchmark.
 | Full-context gpt-4o *(published)* | — | — | ~60% |
 | mem0 *(self-reported)* | — | — | ~49% |
 
-**‡ This is the first row that is actually bwmem.** Every other row is the parent
-stack. It was produced by driving this package through its own public API —
+**‡ These are the rows that are actually bwmem.** Every other row is the parent
+stack.
+
+Both are the **mean of repeated runs**, not a single run: 77.5% over 4 runs
+(range 46-47/60) and 69.0% over 5 runs (range 40-43/60). Single-run numbers on
+this benchmark are not trustworthy at this sample size — three runs of one
+identical configuration scored 40, 42 and 43 of 60 here. Note also that the
+stronger reader is markedly more stable (sd 0.58 vs a 3-question spread), so a
+single cheap-reader run can mislead in either direction by several points.
+
+Same corpus and same shipped defaults for both — k=25, cosine floor 0.5, keyword
+arm off, adaptive depth off. The reader is the only variable, and it is worth
+**+8.5 points**. It was produced by driving this package through its own public API —
 `startSession` / `recordMessage` / `session.end()` / `buildContext()`, installed
 from npm, no direct SQL — with its shipped defaults and nothing hand-tuned for the
 benchmark. 60 questions, 29,568 turns ingested, 0 empty answers, 0 truncated.
 
-It is **not** a like-for-like win over the 70.0% below it. Read against that run's
-corrected figure (80.8% over the answers it actually produced) bwmem is *behind*,
-and 43-vs-42 is one question — inside the ±2 point error bar either way. The
-readers are also near-neighbours rather than identical, so treat the headline
-numbers as "same range".
+### What is actually limiting the score
+
+A 2x2 over retrieval quality and reader quality, same corpus, same 60 questions:
+
+| retrieval | reader | score |
+|---|---|---|
+| bwmem, shipped defaults | flash | 66.7% |
+| **oracle** (gold sessions only) | flash | **80.0%** |
+| bwmem, shipped defaults | **pro** | **78.3%** |
+| **oracle** | **pro** | **88.3%** |
+
+Two things follow, and both are worth stating plainly.
+
+**The remaining retrieval gap is precision, not recall.** Measured directly
+against LongMemEval's `answer_session_ids`, bwmem already surfaces a gold
+session for **91.7%** of questions and every gold session for **85%**. Oracle
+retrieval does not find *more* — it supplies *only* the gold sessions. Removing
+the distractors is worth 13 points. That is why widening the net kept losing
+points, and why raising the fact budget from 30 to 200 did nothing (net +2 over
+two paired runs, p=0.815). The evidence is already there and is being diluted.
+The lever with headroom is **reranking**, not retrieving more.
+
+**88.3% is the ceiling for this pipeline**, not 100%. With perfect retrieval and
+the stronger reader, 7 of 60 are still missed — judge strictness and genuine
+ambiguity. Any claim above that on this harness is measuring something other
+than memory quality.
 
 The category split is the part worth reading, because it is not noise:
 

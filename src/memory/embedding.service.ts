@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { PgClient } from '../db/postgres.js';
 import type { EmbeddingProvider, Logger, SimilarMessage, SimilarConversation } from '../types.js';
-import { messageToOrQuery } from './facts.service.js';
 
 interface CacheEntry {
   embedding: number[];
@@ -11,6 +10,20 @@ interface CacheEntry {
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const CACHE_MAX_SIZE = 100;
 const MAX_INPUT_CHARS = 30000;
+
+/**
+ * Bounds for the keyword arm. The unbounded first version measured WORSE than
+ * no keyword arm at all; these exist to keep it a precision supplement rather
+ * than a second, noisier recall channel.
+ */
+/** Drop a term appearing in more than this fraction of the user's messages. */
+const KEYWORD_MAX_DOC_FREQ = 0.15;
+/** At most this many terms survive into the query, rarest first. */
+const KEYWORD_MAX_TERMS = 6;
+/** Hard cap on rows this arm may contribute, whatever the caller's limit. */
+const KEYWORD_ARM_CAP = 10;
+/** Keep rows within this fraction of the arm's own best rank. Relative, never absolute. */
+const KEYWORD_RELATIVE_FLOOR = 0.35;
 
 /**
  * Cache key = SHA-256 over the truncated input the provider will see.
@@ -197,45 +210,73 @@ export class EmbeddingService {
   }
 
   /**
-   * Keyword arm of hybrid recall: BM25-ish ranking over message text.
+   * Keyword arm of hybrid recall, bounded for PRECISION.
    *
-   * Exists because embeddings are good at topic and bad at rare literal tokens.
-   * A question naming a proper noun, a model number or a coined spelling is
-   * exactly where cosine similarity returns "things that feel related" and a
-   * lexical match returns the row.
+   * The first version of this arm made retrieval measurably worse (70.0% ->
+   * 66.7% tight, 73.3% -> 58.3% wide). It OR'd up to 25 terms with no relevance
+   * floor, so a question naming "train", "airport" and "hotel" matched a large
+   * weakly-related slice of the corpus — and because fusion works on RANK, that
+   * slice entered the fused top-N and displaced rows the vector arm had ranked
+   * well. It was a recall device where the point was precision. The vector arm
+   * already provides recall; this arm exists only to catch what embeddings are
+   * bad at, which is rare literal tokens.
    *
-   * OR'd terms via {@link messageToOrQuery}, not `plainto_tsquery`, which ANDs:
-   * requiring every word of a question to appear in one message matches almost
-   * nothing.
+   * So it is bounded four ways:
    *
-   * Returns `similarity: 0` — these rows were ranked lexically, and reporting a
-   * cosine score for them would be inventing a number. Rank order is what the
-   * fusion step consumes.
+   *   1. NON-DISCRIMINATIVE TERMS ARE DROPPED. A term appearing in a large
+   *      fraction of this user's messages carries no signal — matching it
+   *      returns the corpus. Document frequency is measured against the user's
+   *      own messages rather than assumed, because what is common depends
+   *      entirely on who is talking.
+   *   2. A RELATIVE RANK FLOOR. Rows below a fraction of the best rank in this
+   *      arm are dropped. Relative, never absolute: `ts_rank` scales with
+   *      document length and term frequency, so an absolute floor tuned here
+   *      would silently fail on a corpus with different-length messages.
+   *   3. A HARD CAP on how many rows the arm may contribute, independent of the
+   *      caller's overall limit.
+   *   4. A FUSION WEIGHT below 1 (applied by the caller), so a row the keyword
+   *      arm alone likes cannot outrank one both arms like.
+   *
+   * Returns `similarity: 0` — ranked lexically, so reporting a cosine score
+   * would be inventing a number. Rank order is what fusion consumes.
    */
   async searchMessagesByKeyword(
-    userId: string, query: string, limit = 25, excludeSessionId?: string,
+    userId: string, query: string, limit = KEYWORD_ARM_CAP, excludeSessionId?: string,
   ): Promise<SimilarMessage[]> {
-    const tsq = messageToOrQuery(query);
-    if (!tsq) return [];
+    const candidates = Array.from(new Set(
+      (query.match(/[a-zà-ÿ0-9]{3,}/gi) ?? []).map(t => t.toLowerCase()),
+    )).slice(0, 25);
+    if (candidates.length === 0) return [];
 
     try {
+      const discriminative = await this.selectDiscriminativeTerms(userId, candidates);
+      if (discriminative.length === 0) return [];
+
+      const tsq = discriminative.join(' | ');
       const params: unknown[] = [userId, tsq];
-      // to_tsvector('english', content) verbatim — migration 018's GIN index is
-      // on this exact expression and any variation silently drops to a seq scan.
       let sql = `
-        SELECT id, session_id, content, role, 0 AS similarity, created_at,
-               ts_rank(to_tsvector('english', content), to_tsquery('english', $2)) AS rank
-          FROM ${this.prefix}messages
-         WHERE user_id = $1
-           AND content IS NOT NULL AND content <> ''
-           AND to_tsvector('english', content) @@ to_tsquery('english', $2)
+        WITH scored AS (
+          SELECT id, session_id, content, role, created_at,
+                 ts_rank(to_tsvector('english', content), to_tsquery('english', $2)) AS rank
+            FROM ${this.prefix}messages
+           WHERE user_id = $1
+             AND content IS NOT NULL AND content <> ''
+             AND to_tsvector('english', content) @@ to_tsquery('english', $2)
       `;
       if (excludeSessionId) {
         sql += ` AND session_id != $${params.length + 1}`;
         params.push(excludeSessionId);
       }
-      sql += ` ORDER BY rank DESC LIMIT $${params.length + 1}`;
-      params.push(limit);
+      // The floor is a FRACTION of this query's own best rank, so it travels
+      // to corpora with different message lengths.
+      sql += `
+        )
+        SELECT id, session_id, content, role, 0 AS similarity, created_at
+          FROM scored
+         WHERE rank >= (SELECT MAX(rank) FROM scored) * ${KEYWORD_RELATIVE_FLOOR}
+         ORDER BY rank DESC
+         LIMIT $${params.length + 1}`;
+      params.push(Math.min(limit, KEYWORD_ARM_CAP));
 
       const rows = await this.pg.query<SimilarMessageRow>(sql, params);
       return rows.map(row => ({
@@ -247,11 +288,39 @@ export class EmbeddingService {
         createdAt: row.created_at,
       }));
     } catch (error) {
-      // Keyword recall is an ARM of hybrid search, not the whole of it. A
-      // failure here must degrade to vector-only rather than fail the read.
+      // An arm, not the whole of retrieval: degrade to vector-only.
       this.logger.warn('searchMessagesByKeyword failed', { error: (error as Error).message });
       return [];
     }
+  }
+
+  /**
+   * Keep only the terms that actually narrow the search for THIS user.
+   *
+   * "Hotel" is discriminative for someone who mentions it twice and useless for
+   * someone who books them weekly. Measuring against the user's own corpus is
+   * the only way to tell, and it is one indexed query.
+   */
+  private async selectDiscriminativeTerms(userId: string, terms: string[]): Promise<string[]> {
+    const rows = await this.pg.query<{ term: string; df: number; total: number }>(
+      `WITH total AS (SELECT COUNT(*)::float AS n FROM ${this.prefix}messages WHERE user_id = $1)
+       SELECT t AS term,
+              (SELECT COUNT(*) FROM ${this.prefix}messages m
+                WHERE m.user_id = $1
+                  AND to_tsvector('english', m.content) @@ plainto_tsquery('english', t))::float AS df,
+              (SELECT n FROM total) AS total
+         FROM unnest($2::text[]) AS t`,
+      [userId, terms],
+    );
+
+    const kept = rows
+      .filter(r => r.total > 0 && r.df > 0 && (r.df / r.total) <= KEYWORD_MAX_DOC_FREQ)
+      .sort((a, b) => a.df - b.df)
+      .slice(0, KEYWORD_MAX_TERMS)
+      .map(r => r.term);
+
+    this.logger.debug('keyword arm terms', { candidates: terms.length, kept: kept.length });
+    return kept;
   }
 
   /**
