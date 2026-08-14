@@ -160,7 +160,7 @@ Return JSON array:
 Return [] if no significant knowledge to consolidate.`,
       },
       { role: 'user', content: `Recent patterns:\n${patternsText}` },
-    ], { temperature: 0.2, maxTokens: 1000, json: true });
+    ], { temperature: 0.2, maxTokens: 4000, json: true });
 
     const jsonMatch = response.match(/\[[\s\S]*\]/);
     if (!jsonMatch) return 0;
@@ -229,7 +229,7 @@ Return JSON:
 - updateConfidence: adjust confidence based on fact alignment`,
       },
       { role: 'user', content: `Current knowledge:\n${knowledgeText}` },
-    ], { temperature: 0.2, maxTokens: 500, json: true });
+    ], { temperature: 0.2, maxTokens: 2000, json: true });
 
     try {
       const parsed = JSON.parse(response);

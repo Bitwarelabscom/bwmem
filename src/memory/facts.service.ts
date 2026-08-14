@@ -765,7 +765,12 @@ Return [] if no facts found.`;
       const response = await this.llm.chat([
         { role: 'system', content: systemPrompt },
         { role: 'user', content: `Extract facts from:\n\n${userMessages}` },
-      ], { temperature: 0.1, maxTokens: 2000, json: true });
+      // 2000 was not enough for a long session: the prompt asks for ALL
+      // facts and the output length scales with the transcript. It used to
+      // truncate into partial JSON that the regex below excavated and stored
+      // as facts; since 0.7.0 truncation is a hard error instead, so the cap
+      // has to fit the real workload rather than the happy path.
+      ], { temperature: 0.1, maxTokens: 8000, json: true });
 
       this.logger.debug('Fact extraction LLM response', {
         responseLength: response.length,

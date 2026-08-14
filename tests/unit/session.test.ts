@@ -35,8 +35,40 @@ describe('Session', () => {
       facts, emotional, contradictions,
       llm, // LLM for contradiction detection
       null, // no scheduler
+      null, // no temporal index
       'bwmem_', mockLogger,
     );
+  });
+
+  describe('recordMessage timestamps', () => {
+    it('defaults created_at to now', async () => {
+      pg.willReturn([]);
+      const before = Date.now();
+      const m = await session.recordMessage({ role: 'user', content: 'hi' });
+      expect(m.createdAt.getTime()).toBeGreaterThanOrEqual(before - 1000);
+    });
+
+    it('honours an explicit timestamp so imported history keeps its dates', async () => {
+      // Without this every backfilled message lands at import time, which
+      // collapses the corpus onto one instant and makes recall ordering and
+      // the timeline answer about the import run instead of the conversation.
+      pg.willReturn([]);
+      const when = new Date('2023-05-14T09:30:00Z');
+      const m = await session.recordMessage({
+        role: 'user', content: 'hi', timestamp: when,
+      });
+      expect(m.createdAt.toISOString()).toBe(when.toISOString());
+      expect(pg.queries[0].text).toContain('created_at');
+      expect((pg.queries[0].params as unknown[])[5]).toEqual(when);
+    });
+
+    it('accepts an ISO string', async () => {
+      pg.willReturn([]);
+      const m = await session.recordMessage({
+        role: 'user', content: 'hi', timestamp: '2023-05-14T09:30:00Z',
+      });
+      expect(m.createdAt.toISOString()).toBe('2023-05-14T09:30:00.000Z');
+    });
   });
 
   describe('recordMessage', () => {

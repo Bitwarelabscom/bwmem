@@ -7,6 +7,7 @@ import type { CentroidService } from '../memory/centroid.service.js';
 import type { FactsService } from '../memory/facts.service.js';
 import type { EmotionalMomentsService } from '../memory/emotional-moments.service.js';
 import type { ContradictionService } from '../memory/contradiction.service.js';
+import type { TemporalEventsService } from '../memory/temporal-events.service.js';
 import type { ConsolidationScheduler } from '../consolidation/scheduler.js';
 import type { LLMProvider, Logger, Message, RecordMessageInput, Fact, ExtractedFact } from '../types.js';
 
@@ -24,6 +25,7 @@ export class Session {
   private contradictions: ContradictionService;
   private llm: LLMProvider;
   private scheduler: ConsolidationScheduler | null;
+  private temporalEvents: TemporalEventsService | null;
   private prefix: string;
   private logger: Logger;
   private messageBuffer: Array<{ role: string; content: string }> = [];
@@ -51,6 +53,7 @@ export class Session {
     centroid: CentroidService, facts: FactsService,
     emotionalMoments: EmotionalMomentsService, contradictions: ContradictionService,
     llm: LLMProvider, scheduler: ConsolidationScheduler | null,
+    temporalEvents: TemporalEventsService | null,
     prefix: string, logger: Logger,
   ) {
     this.id = id;
@@ -65,6 +68,7 @@ export class Session {
     this.contradictions = contradictions;
     this.llm = llm;
     this.scheduler = scheduler;
+    this.temporalEvents = temporalEvents;
     this.prefix = prefix;
     this.logger = logger;
   }
@@ -75,12 +79,17 @@ export class Session {
 
     const messageId = uuidv4();
     const { role, content } = input;
+    const createdAt = input.timestamp
+      ? (input.timestamp instanceof Date ? input.timestamp : new Date(input.timestamp))
+      : new Date();
 
-    // Insert message (without embedding - that's async)
+    // Insert message (without embedding - that's async). created_at is written
+    // explicitly rather than left to the column default so imported history
+    // keeps its real dates; see RecordMessageInput.timestamp.
     await this.pg.query(
-      `INSERT INTO ${this.prefix}messages (id, session_id, user_id, role, content)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [messageId, this.id, this.userId, role, content]
+      `INSERT INTO ${this.prefix}messages (id, session_id, user_id, role, content, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [messageId, this.id, this.userId, role, content, createdAt]
     );
 
     this.messageBuffer.push({ role, content });
@@ -99,7 +108,7 @@ export class Session {
       userId: this.userId,
       role,
       content,
-      createdAt: new Date(),
+      createdAt,
     };
   }
 
@@ -129,6 +138,8 @@ export class Session {
       await this.scheduler.addEpisodicJob(this.userId, this.id);
     }
 
+    await this.extractTemporalEvents();
+
     this.logger.info('Session ended', { sessionId: this.id, messages: this.messageBuffer.length });
 
     // Notify any observer (e.g., API layer in-memory map) that this session
@@ -136,6 +147,51 @@ export class Session {
     if (this._onEnd) {
       try { this._onEnd(); } catch { /* observer errors must not bubble */ }
       this._onEnd = null;
+    }
+  }
+
+  /**
+   * Populate the temporal index from this session's transcript.
+   *
+   * The index had no write path at all before 0.8.0. `extract()` and `store()`
+   * were public methods on the service and nothing in the package called
+   * either, so `temporal_events` stayed empty forever and the `[Timeline]`
+   * block could only ever render nothing — a whole feature that was reachable
+   * in the config, documented in the README, and structurally inert.
+   *
+   * Best-effort by design: this runs after the session is already marked ended,
+   * and a failed extraction must not fail `end()` for the caller.
+   */
+  private async extractTemporalEvents(): Promise<void> {
+    if (!this.temporalEvents || this.messageBuffer.length === 0) return;
+
+    try {
+      const messages = await this.getMessages();
+      if (messages.length === 0) return;
+
+      const transcript = messages
+        .map(m => `${m.role.toUpperCase()}: ${m.content}`)
+        .join('\n');
+
+      // The session's own date anchors relative expressions ("last Tuesday"),
+      // which is the entire point of a temporal index — resolving them against
+      // extraction time instead would date every event to the ingest run.
+      const first = messages[0]?.createdAt;
+      const mentionedOn = first
+        ? new Date(first).toISOString().slice(0, 10)
+        : null;
+
+      const events = await this.temporalEvents.extract(transcript, mentionedOn);
+      if (events.length === 0) return;
+
+      const stored = await this.temporalEvents.store(
+        this.userId, this.id, events, mentionedOn,
+      );
+      this.logger.debug('temporal events stored', { sessionId: this.id, stored });
+    } catch (error) {
+      this.logger.warn('temporal extraction failed', {
+        sessionId: this.id, error: (error as Error).message,
+      });
     }
   }
 
@@ -166,7 +222,9 @@ export class Session {
   private async processMessageBackground(messageId: string, role: string, content: string): Promise<void> {
     // Store the embedding FIRST (fast, recall-critical) so memory is queryable
     // within ~300ms — not gated behind the slow LLM sentiment call below.
-    await this.embedding.storeMessageEmbedding(messageId, this.userId, this.id, content, role);
+    const messageEmbedding = await this.embedding.storeMessageEmbedding(
+      messageId, this.userId, this.id, content, role,
+    );
 
     // Sentiment (LLM) runs after the embedding is already queryable; update the row.
     const sentimentResult = await this.sentiment.analyze(content);
@@ -174,9 +232,12 @@ export class Session {
       messageId, sentimentResult.valence, sentimentResult.arousal, sentimentResult.dominance,
     );
 
-    // Update session centroid
+    // Update session centroid, reusing the vector we just computed. This used
+    // to call generate() again on the identical string — a second paid
+    // embedding of text already embedded one statement earlier, on every
+    // message. Only falls back to a fresh call if the store failed.
     try {
-      const emb = await this.embedding.generate(content);
+      const emb = messageEmbedding ?? await this.embedding.generate(content);
       await this.centroid.update(this.id, emb);
     } catch { /* non-critical */ }
 

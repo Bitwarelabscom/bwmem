@@ -6,6 +6,7 @@ import type { CentroidService } from '../memory/centroid.service.js';
 import type { FactsService } from '../memory/facts.service.js';
 import type { EmotionalMomentsService } from '../memory/emotional-moments.service.js';
 import type { ContradictionService } from '../memory/contradiction.service.js';
+import type { TemporalEventsService } from '../memory/temporal-events.service.js';
 import type { ConsolidationScheduler } from '../consolidation/scheduler.js';
 import type { LLMProvider, Logger, SessionConfig } from '../types.js';
 import { Session } from './session.js';
@@ -19,6 +20,7 @@ export class SessionManager {
   private emotionalMoments: EmotionalMomentsService;
   private contradictions: ContradictionService;
   private llm: LLMProvider;
+  private temporalEvents: TemporalEventsService | null;
   private prefix: string;
   private inactivityTimeoutMs: number;
   private logger: Logger;
@@ -31,6 +33,7 @@ export class SessionManager {
     centroid: CentroidService, facts: FactsService,
     emotionalMoments: EmotionalMomentsService, contradictions: ContradictionService,
     llm: LLMProvider,
+    temporalEvents: TemporalEventsService | null,
     prefix: string, inactivityTimeoutMs: number, logger: Logger,
   ) {
     this.pg = pg;
@@ -41,6 +44,7 @@ export class SessionManager {
     this.emotionalMoments = emotionalMoments;
     this.contradictions = contradictions;
     this.llm = llm;
+    this.temporalEvents = temporalEvents;
     this.prefix = prefix;
     this.inactivityTimeoutMs = inactivityTimeoutMs;
     this.logger = logger;
@@ -60,7 +64,7 @@ export class SessionManager {
       sessionId, config.userId, config.metadata ?? {},
       this.pg, this.embedding, this.sentiment, this.centroid,
       this.facts, this.emotionalMoments, this.contradictions,
-      this.llm, scheduler, this.prefix, this.logger,
+      this.llm, scheduler, this.temporalEvents, this.prefix, this.logger,
     );
 
     // Set up inactivity timeout

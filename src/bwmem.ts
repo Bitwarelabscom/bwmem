@@ -141,7 +141,7 @@ export class BwMem {
     const sessionManager = new SessionManager(
       pg, embedding, sentiment, centroid,
       facts, emotionalMoments, contradictions,
-      this.config.llm,
+      this.config.llm, temporalEvents,
       prefix, this.config.session.inactivityTimeoutMs, logger,
     );
 

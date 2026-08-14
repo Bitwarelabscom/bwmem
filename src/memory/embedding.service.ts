@@ -123,7 +123,7 @@ export class EmbeddingService {
     messageId: string, userId: string, sessionId: string,
     content: string, role: string,
     sentimentValence?: number, sentimentArousal?: number, sentimentDominance?: number,
-  ): Promise<void> {
+  ): Promise<number[] | null> {
     try {
       const embedding = await this.generate(content);
       const vectorString = `[${embedding.join(',')}]`;
@@ -140,8 +140,14 @@ export class EmbeddingService {
         [messageId, sessionId, userId, role, content, vectorString,
          sentimentValence ?? null, sentimentArousal ?? null, sentimentDominance ?? null]
       );
+      // Returned so callers that need the same vector (the session centroid)
+      // can reuse it. It used to return void and the centroid re-embedded the
+      // identical string, which doubled the embedding bill for every message
+      // in the system to recompute a value that was already in hand.
+      return embedding;
     } catch (error) {
       this.logger.error('Failed to store message embedding', { error: (error as Error).message, messageId });
+      return null;
     }
   }
 

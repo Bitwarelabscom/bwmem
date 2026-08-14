@@ -66,7 +66,7 @@ Pattern types:
 Return [] if no significant patterns found.`,
         },
         { role: 'user', content: transcript.slice(0, 6000) },
-      ], { temperature: 0.2, maxTokens: 1000, json: true });
+      ], { temperature: 0.2, maxTokens: 4000, json: true });
 
       const jsonMatch = response.match(/\[[\s\S]*\]/);
       if (!jsonMatch) {

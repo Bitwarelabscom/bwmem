@@ -237,6 +237,15 @@ export interface Message {
 export interface RecordMessageInput {
   role: 'user' | 'assistant' | 'system';
   content: string;
+  /**
+   * When the message was actually sent. Defaults to now.
+   *
+   * Required for importing existing history: without it every backfilled
+   * message is dated at import time, which collapses the whole corpus onto one
+   * instant. Recall ordering, the `[Timeline]` block and every "when did I..."
+   * question then answer against the import run rather than the conversation.
+   */
+  timestamp?: Date | string;
 }
 
 // ---- Emotional / Behavioral ----

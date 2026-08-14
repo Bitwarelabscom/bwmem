@@ -81,7 +81,15 @@ export function resolveConfig(input: BwMemConfig): ResolvedConfig {
     },
     factKeyMerge: input.factKeyMerge !== false,
     inlineContradictions: input.inlineContradictions === true,
-    temporalIndex: input.temporalIndex === true,
+    // Default ON since 0.8.0. It was opt-in, and opt-in to a feature with no
+    // write path meant nobody could have used it anyway. In the benchmark's
+    // best run this block is where the points were: temporal-reasoning 93.8%
+    // and knowledge-update 100%, vs 62.5% and 66.7% without it.
+    //
+    // The cost is one extraction call per ended session and one embedding call
+    // per temporal-looking query — set `temporalIndex: false` if that is not
+    // worth it for your workload.
+    temporalIndex: input.temporalIndex !== false,
     exclusiveFamilies: input.exclusiveFamilies ?? DEFAULT_EXCLUSIVE_FAMILIES,
     session: {
       inactivityTimeoutMs: input.session?.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS,

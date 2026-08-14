@@ -112,7 +112,7 @@ export class TemporalEventsService {
         ],
         // Generous on purpose: a reasoning model with a tight cap spends the
         // whole budget thinking and returns an empty string.
-        { temperature: 0, maxTokens: 4000, json: true },
+        { temperature: 0, maxTokens: 8000, json: true },
       );
 
       const deadline = new Promise<null>((resolve) => {
@@ -200,7 +200,8 @@ export class TemporalEventsService {
       try {
         const [vec] = await this.embeddings.generateBatch([question]);
         rows = await this.pg.query(
-          `SELECT subject, predicate, object, summary, occurred_on, precision
+          `SELECT subject, predicate, object, summary, precision,
+                  to_char(occurred_on, 'YYYY-MM-DD') AS occurred_on
              FROM (
                SELECT *, embedding <=> $2::vector AS distance
                  FROM ${this.prefix}temporal_events
@@ -214,7 +215,8 @@ export class TemporalEventsService {
       } catch {
         // Embedder down: fall back to the most recent events, still sorted.
         rows = await this.pg.query(
-          `SELECT subject, predicate, object, summary, occurred_on, precision
+          `SELECT subject, predicate, object, summary, precision,
+                  to_char(occurred_on, 'YYYY-MM-DD') AS occurred_on
              FROM ${this.prefix}temporal_events
             WHERE user_id = $1
             ORDER BY occurred_on DESC NULLS LAST
@@ -226,9 +228,13 @@ export class TemporalEventsService {
       if (rows.length === 0) return '';
 
       const lines = rows.map((r) => {
-        const when = r.occurred_on
-          ? new Date(r.occurred_on as string).toISOString().slice(0, 10)
-          : 'date unknown';
+        // Already 'YYYY-MM-DD' from to_char. Deliberately NOT round-tripped
+        // through `new Date(...).toISOString()`: occurred_on is a DATE, which
+        // node-postgres parses to LOCAL midnight, and toISOString() then
+        // converts to UTC — so east of Greenwich every event rendered one day
+        // early. On a benchmark that is largely date arithmetic, that is not
+        // cosmetic.
+        const when = (r.occurred_on as string | null) ?? 'date unknown';
         const obj = r.object ? ` ${r.object}` : '';
         return `- ${when}: ${r.subject} ${r.predicate}${obj} — ${r.summary}`;
       });
