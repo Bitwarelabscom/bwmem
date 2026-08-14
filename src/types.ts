@@ -254,6 +254,27 @@ export interface EmotionalMoment {
   createdAt: Date;
 }
 
+/**
+ * Which value won, recorded when a contradiction is resolved. Required to
+ * resolve: a close-out that carries only a free-text note is a mute, because
+ * nothing downstream can read prose.
+ *
+ *   user_stated - what the user said now was right; the stored fact was wrong
+ *   stored      - the stored fact was right; the user misspoke or misremembered
+ *   neither     - both wrong, or the question dissolved
+ */
+export type ContradictionDecision = 'user_stated' | 'stored' | 'neither';
+
+/**
+ * Lifecycle state (0.7.0, migration 017).
+ *
+ *   open     - outstanding, nobody has decided
+ *   held     - set aside without a decision; LAPSES when the underlying fact
+ *              moves off the value the hold was taken against
+ *   resolved - decided, with the decision recorded
+ */
+export type ContradictionStatus = 'open' | 'held' | 'resolved';
+
 export interface ContradictionSignal {
   id: string;
   userId: string;
@@ -262,6 +283,16 @@ export interface ContradictionSignal {
   userStated: string;
   storedValue: string;
   signalType: 'correction' | 'misremember';
+  status: ContradictionStatus;
+  decision: ContradictionDecision | null;
+  resolution: string | null;
+  resolvedAt: Date | null;
+  heldAt: Date | null;
+  holdReason: string | null;
+  /**
+   * DISPLAY bookkeeping: has this been shown to the user. Not a lifecycle
+   * state — read `status` for that. Conflating the two is the bug 017 fixed.
+   */
   surfaced: boolean;
   surfacedSessionIds: string[];
   createdAt: Date;

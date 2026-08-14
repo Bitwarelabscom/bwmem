@@ -251,8 +251,15 @@ export class BwMem {
   get contradictions(): ContradictionsAPI {
     const s = this.ensureReady();
     return {
+      getOpen: (userId, sessionId, limit) =>
+        s.contradictions.getOpen(userId, sessionId, limit),
       getUnsurfaced: (userId, sessionId, limit) =>
-        s.contradictions.getUnsurfaced(userId, sessionId, limit),
+        s.contradictions.getOpen(userId, sessionId, limit),
+      resolve: (userId, id, decision, note) =>
+        s.contradictions.resolve(userId, id, decision, note),
+      hold: (userId, id, reason) =>
+        s.contradictions.hold(userId, id, reason),
+      counts: (userId) => s.contradictions.counts(userId),
       detectInline: (message, facts) =>
         s.contradictions.detectInline(message, facts),
     };
@@ -412,7 +419,22 @@ interface EmotionsAPI {
 }
 
 interface ContradictionsAPI {
+  /** Outstanding contradictions — filtered on lifecycle status, not on the display flag. */
+  getOpen(userId: string, sessionId?: string, limit?: number): Promise<ContradictionSignal[]>;
+  /** @deprecated Renamed to {@link ContradictionsAPI.getOpen} in 0.7.0. Delegates to it. */
   getUnsurfaced(userId: string, sessionId?: string, limit?: number): Promise<ContradictionSignal[]>;
+  /**
+   * Close one with a decision. Before 0.7.0 there was no way to do this at all:
+   * the only exit was being displayed twice, which is not a decision.
+   */
+  resolve(
+    userId: string, id: string,
+    decision: import('./types.js').ContradictionDecision,
+    note?: string,
+  ): Promise<boolean>;
+  /** Set one aside without deciding. Lapses when the underlying fact moves. */
+  hold(userId: string, id: string, reason?: string): Promise<boolean>;
+  counts(userId: string): Promise<{ open: number; held: number; resolved: number }>;
   detectInline(message: string, facts: Fact[]): import('./types.js').InlineContradiction[];
 }
 

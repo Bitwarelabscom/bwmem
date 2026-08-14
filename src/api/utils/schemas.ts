@@ -140,6 +140,23 @@ export const contradictionsQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(50).optional(),
 });
 
+export const contradictionIdParamsSchema = z.object({
+  userId: z.string().min(1).max(255),
+  id: z.string().uuid(),
+});
+
+// `decision` is required, and that is the design: a close-out carrying only a
+// note is a mute, because nothing downstream can read prose. The note is where
+// the prose goes.
+export const contradictionResolveSchema = z.object({
+  decision: z.enum(['user_stated', 'stored', 'neither']),
+  note: z.string().max(600).optional(),
+});
+
+export const contradictionHoldSchema = z.object({
+  reason: z.string().max(300).optional(),
+});
+
 // ---- Consolidation ----
 
 export const consolidateSchema = z.object({
@@ -311,6 +328,9 @@ export type EmotionsParams = z.infer<typeof emotionsParamsSchema>;
 export type EmotionsQuery = z.infer<typeof emotionsQuerySchema>;
 export type ContradictionsParams = z.infer<typeof contradictionsParamsSchema>;
 export type ContradictionsQuery = z.infer<typeof contradictionsQuerySchema>;
+export type ContradictionIdParams = z.infer<typeof contradictionIdParamsSchema>;
+export type ContradictionResolveRequest = z.infer<typeof contradictionResolveSchema>;
+export type ContradictionHoldRequest = z.infer<typeof contradictionHoldSchema>;
 export type ConsolidateRequest = z.infer<typeof consolidateSchema>;
 export type SummaryParams = z.infer<typeof summaryParamsSchema>;
 export type GraphParams = z.infer<typeof graphParamsSchema>;

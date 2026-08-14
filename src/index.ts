@@ -41,6 +41,8 @@ export type {
   // Emotional / Behavioral
   EmotionalMoment,
   ContradictionSignal,
+  ContradictionDecision,
+  ContradictionStatus,
   InlineContradiction,
   BehavioralObservation,
   SentimentResult,

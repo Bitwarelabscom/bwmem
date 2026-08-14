@@ -176,31 +176,64 @@ describe('ContradictionService', () => {
     });
   });
 
-  describe('getUnsurfaced', () => {
-    it('returns unsurfaced contradictions', async () => {
-      pg.willReturn([{
-        id: 'sig-1',
-        user_id: 'user-1',
-        session_id: 'session-1',
-        fact_key: 'location',
-        user_stated: 'New York',
-        stored_value: 'San Francisco',
-        signal_type: 'correction',
-        surfaced: false,
-        surfaced_session_ids: [],
-        created_at: new Date(),
-      }]);
+  describe('getOpen', () => {
+    /** getOpen runs the hold-lapse sweep first, so the SELECT is the second query. */
+    const openRow = {
+      id: 'sig-1',
+      user_id: 'user-1',
+      session_id: 'session-1',
+      fact_key: 'location',
+      user_stated: 'New York',
+      stored_value: 'San Francisco',
+      signal_type: 'correction',
+      status: 'open',
+      decision: null,
+      resolution: null,
+      resolved_at: null,
+      held_at: null,
+      hold_reason: null,
+      surfaced: false,
+      surfaced_session_ids: [],
+      created_at: new Date(),
+    };
 
-      const result = await service.getUnsurfaced('user-1');
+    it('returns open contradictions', async () => {
+      pg.willReturn([]).willReturn([openRow]);
+
+      const result = await service.getOpen('user-1');
       expect(result).toHaveLength(1);
       expect(result[0].factKey).toBe('location');
       expect(result[0].signalType).toBe('correction');
+      expect(result[0].status).toBe('open');
+    });
+
+    it('filters on status, not on the display flag', async () => {
+      // The whole point of 017. `surfaced` said "has been shown"; every reader
+      // took it to mean "has been dealt with".
+      pg.willReturn([]).willReturn([]);
+      await service.getOpen('user-1');
+      expect(pg.lastQuery).toContain("status = 'open'");
+      expect(pg.lastQuery).not.toContain('surfaced = FALSE');
     });
 
     it('excludes already-surfaced-in-session signals', async () => {
-      pg.willReturn([]);
-      await service.getUnsurfaced('user-1', 'session-2');
+      pg.willReturn([]).willReturn([]);
+      await service.getOpen('user-1', 'session-2');
       expect(pg.lastQuery).toContain('surfaced_session_ids');
+    });
+
+    it('lapses stale holds before reading', async () => {
+      pg.willReturn([]).willReturn([]);
+      await service.getOpen('user-1');
+      expect(pg.queries[0].text).toContain("status = 'held'");
+      expect(pg.queries[0].text).toContain("SET status        = 'open'");
+    });
+
+    it('getUnsurfaced still works and delegates to getOpen', async () => {
+      pg.willReturn([]).willReturn([openRow]);
+      const result = await service.getUnsurfaced('user-1');
+      expect(result).toHaveLength(1);
+      expect(pg.lastQuery).toContain("status = 'open'");
     });
   });
 
@@ -211,9 +244,80 @@ describe('ContradictionService', () => {
       expect(pg.lastQuery).toContain('array_append');
     });
 
+    it('holds rather than resolves once shown repeatedly', async () => {
+      // Being looked at three times and ignored is not a decision. It used to
+      // set the same flag that meant "dealt with", which is why "resolved"
+      // could never be counted.
+      pg.willReturn([]);
+      await service.markSurfaced(['sig-1'], 'session-3');
+      expect(pg.lastQuery).toContain("THEN 'held'");
+      expect(pg.lastQuery).not.toContain("'resolved'");
+      expect(pg.lastQuery).toContain('held_at_value');
+    });
+
     it('does nothing for empty ids', async () => {
       await service.markSurfaced([], 'session-1');
       expect(pg.queries).toHaveLength(0);
+    });
+  });
+
+  describe('resolve', () => {
+    it('records which value won, not just a note', async () => {
+      pg.willReturnOne({ id: 'sig-1' });
+      const ok = await service.resolve('user-1', 'sig-1', 'user_stated', 'they moved');
+      expect(ok).toBe(true);
+      expect(pg.lastQuery).toContain("status      = 'resolved'");
+      expect(pg.lastQuery).toContain('decision');
+      expect(pg.lastParams).toContain('user_stated');
+    });
+
+    it('rejects an unknown decision without touching the database', async () => {
+      const ok = await service.resolve('user-1', 'sig-1', 'whatever' as never);
+      expect(ok).toBe(false);
+      expect(pg.queries).toHaveLength(0);
+    });
+
+    it('reports false when no row moved', async () => {
+      pg.willReturnOne(null);
+      expect(await service.resolve('user-1', 'sig-1', 'stored')).toBe(false);
+    });
+
+    it('clears the hold fields so a resolved row cannot lapse back to open', async () => {
+      pg.willReturnOne({ id: 'sig-1' });
+      await service.resolve('user-1', 'sig-1', 'neither');
+      expect(pg.lastQuery).toContain('held_at_value = NULL');
+    });
+  });
+
+  describe('hold', () => {
+    it('pins the hold to the value it was taken against', async () => {
+      pg.willReturnOne({ id: 'sig-1' });
+      const ok = await service.hold('user-1', 'sig-1', 'ask them later');
+      expect(ok).toBe(true);
+      expect(pg.lastQuery).toContain('held_at_value = stored_value');
+      expect(pg.lastQuery).toContain("status        = 'held'");
+    });
+
+    it('only holds an open signal', async () => {
+      pg.willReturnOne(null);
+      await service.hold('user-1', 'sig-1');
+      expect(pg.lastQuery).toContain("status = 'open'");
+    });
+  });
+
+  describe('counts', () => {
+    it('reports all three states', async () => {
+      pg.willReturn([
+        { status: 'open', n: '3' },
+        { status: 'held', n: '1' },
+        { status: 'resolved', n: '7' },
+      ]);
+      expect(await service.counts('user-1')).toEqual({ open: 3, held: 1, resolved: 7 });
+    });
+
+    it('reports zero for states with no rows', async () => {
+      pg.willReturn([{ status: 'open', n: '2' }]);
+      expect(await service.counts('user-1')).toEqual({ open: 2, held: 0, resolved: 0 });
     });
   });
 
@@ -230,6 +334,12 @@ describe('ContradictionService', () => {
         userStated: 'New York',
         storedValue: 'San Francisco',
         signalType: 'correction' as const,
+        status: 'open' as const,
+        decision: null,
+        resolution: null,
+        resolvedAt: null,
+        heldAt: null,
+        holdReason: null,
         surfaced: false,
         surfacedSessionIds: [],
         createdAt: new Date(),

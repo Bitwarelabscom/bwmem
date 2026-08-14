@@ -34,6 +34,8 @@ displaced). Run migration 015.
 - **Semantic search** — find similar messages and conversations via pgvector embeddings
 - **Emotional capture** — detects high-emotion moments using VAD (Valence-Arousal-Dominance) analysis with specific descriptive tags
 - **Contradiction detection** — both async (on fact supersession) and **inline** (real-time, zero-I/O scan during message ingestion), with stopword and volatile-key filtering to dampen false positives
+- **Contradiction lifecycle** — open / held / resolved, where a resolve must name which value won and a hold lapses when the underlying fact moves. Replaces a display flag that no code path could ever turn into a resolution (0.7.0)
+- **Truncation is an error** — providers read `finish_reason` and refuse to hand back a cut-off completion, instead of returning a prefix that regex-and-`JSON.parse` will happily store as a finished answer (0.7.0)
 - **Quality scoring** — per-response scoring split into `output_integrity` (the agent's own quality: relevance, coherence, memory fidelity, generativity, completeness) and `interaction_vitality` (engagement: reply speed, length, feedback class). Engagement noise no longer drags down the agent's self-score.
 - **Session texture** — captures the *throughline* (what was being worked through) and *emotional register* of a session at close; surfaces as an anchor on the next session in the same (mode, speaker) pair. Hands the next session momentum, not just facts.
 - **Self-intentions** — held things-to-do with deliberate save, daily surfacing, and a 3-deferral do-or-let-go ceiling. Mirror, not gate.
@@ -166,6 +168,57 @@ await mem.textures.capture(session.id); // anchor for the next session
 
 await mem.shutdown();
 ```
+
+## What's new in 0.7.0
+
+### Contradictions could never be resolved
+
+The `contradiction_signals` table had exactly one piece of state: `surfaced BOOLEAN`. It was flipped true once a signal had been **displayed** in two sessions:
+
+```sql
+surfaced = CASE WHEN array_length(surfaced_session_ids, 1) >= 2 THEN TRUE ...
+```
+
+So "shown twice" was the only way a contradiction ever left the queue. Nobody ever decided anything. Every reader — the dedup index, the retrieval filter, the partial index added in 0.5.0 — treated `surfaced = FALSE` as "still outstanding" and therefore `surfaced = TRUE` as "dealt with". Migration 012's own comment says it out loud: *"the index is partial on surfaced = FALSE, so a **resolved** signal never blocks a genuine recurrence later."* There was no resolved signal, and no way to make one: the public API exposed `getUnsurfaced()` and nothing else, so a consumer could read the queue and could never close anything on it.
+
+The counts that followed weren't slightly wrong, they were structurally impossible. "Resolved contradictions" could only ever be zero, and a signal looked at twice and ignored was indistinguishable from one that had actually been settled.
+
+There are three states now, and `surfaced` goes back to meaning only what it measures:
+
+| State | Meaning |
+|-------|---------|
+| `open` | Outstanding. Nobody has decided. |
+| `held` | Deliberately set aside. **Not** a decision, and it **lapses** — see below. |
+| `resolved` | Decided, with the decision recorded. |
+
+```typescript
+// Read the queue
+const open = await mem.contradictions.getOpen(userId, sessionId);
+
+// Close one — `decision` is required
+await mem.contradictions.resolve(userId, id, 'user_stated', 'they moved in June');
+
+// Or set it aside without deciding
+await mem.contradictions.hold(userId, id, 'ask them in person');
+
+await mem.contradictions.counts(userId); // { open: 3, held: 1, resolved: 7 }
+```
+
+`getUnsurfaced()` still works and delegates to `getOpen()`. The old name described the filter it applied, and that filter was the bug.
+
+### A resolve has to say which value won
+
+`decision` is required, and that's the design: `'user_stated' | 'stored' | 'neither'` names which value won, so something downstream can act on the outcome. This is the same lesson 0.6.0 wrote into fact collisions — a close-out carrying only a free-text note is a **mute dressed as a decision**, because nothing can read prose. The note is optional and is where the prose goes.
+
+### A hold lapses when the fact moves
+
+A hold is pinned to the value it was taken against (`held_at_value`). Once the live fact no longer says what it said when the row was held, the reason for holding is gone and the signal returns to `open` on its own. Without that, a hold would be indistinguishable from a resolve — both make the row disappear, and only one of them was a decision. The sweep runs on the read path, so a caller cannot forget it.
+
+Upgrading from 0.6.x, every previously-surfaced row becomes **held**, never resolved. Resolving them would be inventing a decision nobody made — the exact failure this release exists to correct. And because holds lapse, any of them still live against a fact that has since moved will come back on their own rather than staying buried.
+
+### Truncated LLM output is no longer silently parsed
+
+Every provider ended `chat()` with `?? ''` and discarded the finish reason, so a completion that hit its token ceiling came back as a valid-looking prefix and got `JSON.parse`d as if it were whole. See [Truncation is an error, not a value](#truncation-is-an-error-not-a-value) and [Reasoning models and small token budgets](#reasoning-models-and-small-token-budgets).
 
 ## What's new in 0.6.0
 
@@ -525,7 +578,10 @@ All endpoints under `/api/v1/`. Auth via `Authorization: Bearer <key>`.
 | `DELETE` | `/facts/:factId` | Delete a fact |
 | `GET` | `/facts/:userId/search?query=` | Search facts |
 | `GET` | `/emotions/:userId` | Emotional moments |
-| `GET` | `/contradictions/:userId` | Contradictions |
+| `GET` | `/contradictions/:userId` | Open contradictions |
+| `GET` | `/contradictions/:userId/counts` | Open / held / resolved counts |
+| `POST` | `/contradictions/:userId/:id/resolve` | Close with a decision (required) |
+| `POST` | `/contradictions/:userId/:id/hold` | Set aside without deciding |
 | `POST` | `/quality/score` | Score a response (phase 1) |
 | `POST` | `/quality/followup` | Resolve followup (phase 2) |
 | `GET` | `/quality/:userId/stats` | Quality aggregates |

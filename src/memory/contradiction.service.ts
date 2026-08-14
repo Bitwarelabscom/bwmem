@@ -1,5 +1,8 @@
 import type { PgClient } from '../db/postgres.js';
-import type { Logger, ContradictionSignal, InlineContradiction, Fact } from '../types.js';
+import type {
+  Logger, ContradictionSignal, ContradictionDecision, ContradictionStatus,
+  InlineContradiction, Fact,
+} from '../types.js';
 import { getConceptTokens, getSemantics } from './fact-semantics.js';
 import { isVolatileFactKey } from './facts.service.js';
 import type { ParaphraseGate } from './paraphrase-gate.service.js';
@@ -147,13 +150,19 @@ export class ContradictionService {
       return;
     }
     try {
-      // Upsert on (user_id, fact_key, md5(stored_value)) WHERE surfaced = FALSE.
+      // Upsert on (user_id, fact_key, md5(stored_value)) WHERE status = 'open'.
       //
       // The old guard was per-SESSION, which only suppressed repeats inside one
       // conversation — the case that matters least. Across sessions, one stale
       // fact that came up eight times became eight rows, and anything reading
       // the count as a rate reported "recall is drifting" when exactly one fact
       // was out of date.
+      //
+      // Keyed on `status` since 017, not on `surfaced`: a signal used to fall
+      // out of this guard the moment it had been DISPLAYED twice, so the ninth
+      // sighting of the same unresolved disagreement opened a second row and the
+      // counter started over. An open disagreement now stays one row until
+      // somebody actually decides it.
       //
       // created_at is deliberately NOT touched on conflict: it is the FIRST
       // sighting, and "this has been wrong since Tuesday" is only answerable if
@@ -166,7 +175,7 @@ export class ContradictionService {
           (user_id, session_id, fact_key, user_stated, stored_value, signal_type,
            gate_path, gate_similarity, gate_reason)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-         ON CONFLICT (user_id, fact_key, md5(stored_value)) WHERE surfaced = FALSE
+         ON CONFLICT (user_id, fact_key, md5(stored_value)) WHERE status = 'open'
          DO UPDATE SET
            repeat_count    = ${this.prefix}contradiction_signals.repeat_count + 1,
            last_seen_at    = NOW(),
@@ -192,19 +201,68 @@ export class ContradictionService {
   }
 
   /**
-   * Get unsurfaced contradictions for a user, deduplicated per fact_key. Only
-   * the most recent signal per key is returned, so repeated supersessions of
-   * the same fact do not flood the prompt with "you said X but stored Y" lines.
+   * Reopen holds that events have overtaken.
+   *
+   * A hold is a "not now", not a verdict, so it is scoped to the value it was
+   * taken against. Once the live fact no longer says what it said when the row
+   * was held, the reason for holding is gone and the signal goes back to open.
+   * Without this a hold is indistinguishable from a resolve: both make the row
+   * disappear, and only one of them was a decision.
+   *
+   * Runs on the read path so a caller cannot forget it. The partial index on
+   * (user_id, fact_key) WHERE status = 'held' keeps it an index probe, and the
+   * common case updates nothing.
    */
-  async getUnsurfaced(userId: string, sessionId?: string, limit = 3): Promise<ContradictionSignal[]> {
+  async lapseStaleHolds(userId: string): Promise<number> {
     try {
+      const rows = await this.pg.query<{ id: string }>(
+        `UPDATE ${this.prefix}contradiction_signals c
+            SET status        = 'open',
+                held_at       = NULL,
+                hold_reason   = NULL,
+                held_at_value = NULL
+          WHERE c.user_id = $1
+            AND c.status = 'held'
+            AND NOT EXISTS (
+              SELECT 1 FROM ${this.prefix}facts f
+               WHERE f.user_id = c.user_id
+                 AND f.fact_key = c.fact_key
+                 AND f.fact_status = 'active'
+                 AND f.fact_value IS NOT DISTINCT FROM c.held_at_value
+            )
+        RETURNING c.id`,
+        [userId],
+      );
+      if (rows.length > 0) {
+        this.logger.debug('contradiction holds lapsed', { userId, count: rows.length });
+      }
+      return rows.length;
+    } catch (error) {
+      this.logger.error('lapseStaleHolds failed', { error: (error as Error).message });
+      return 0;
+    }
+  }
+
+  /**
+   * Open contradictions for a user, deduplicated per fact_key. Only the most
+   * recent signal per key is returned, so repeated supersessions of the same
+   * fact do not flood the prompt with "you said X but stored Y" lines.
+   *
+   * Filters on `status`, not on `surfaced`. Those are different axes and
+   * treating the display flag as the lifecycle is what 017 removed.
+   */
+  async getOpen(userId: string, sessionId?: string, limit = 3): Promise<ContradictionSignal[]> {
+    try {
+      await this.lapseStaleHolds(userId);
+
       const params: unknown[] = [userId];
       let sql = `
         SELECT DISTINCT ON (fact_key)
           id, user_id, session_id, fact_key, user_stated, stored_value,
-          signal_type, surfaced, surfaced_session_ids, created_at
+          signal_type, status, decision, resolution, resolved_at,
+          held_at, hold_reason, surfaced, surfaced_session_ids, created_at
         FROM ${this.prefix}contradiction_signals
-        WHERE user_id = $1 AND surfaced = FALSE
+        WHERE user_id = $1 AND status = 'open'
       `;
 
       if (sessionId) {
@@ -216,25 +274,36 @@ export class ContradictionService {
       params.push(limit);
 
       const rows = await this.pg.query<Record<string, unknown>>(sql, params);
-      return rows.map(row => ({
-        id: row.id as string,
-        userId: row.user_id as string,
-        sessionId: row.session_id as string | undefined,
-        factKey: row.fact_key as string,
-        userStated: row.user_stated as string,
-        storedValue: row.stored_value as string,
-        signalType: row.signal_type as ContradictionSignal['signalType'],
-        surfaced: row.surfaced as boolean,
-        surfacedSessionIds: (row.surfaced_session_ids as string[]) ?? [],
-        createdAt: row.created_at as Date,
-      }));
+      return rows.map(mapSignal);
     } catch (error) {
-      this.logger.error('getUnsurfaced failed', { error: (error as Error).message });
+      this.logger.error('getOpen failed', { error: (error as Error).message });
       return [];
     }
   }
 
-  /** Mark contradictions as surfaced in a session. */
+  /**
+   * @deprecated Renamed to {@link getOpen} in 0.7.0. The old name described the
+   * filter it used to apply — "unsurfaced" — and that filter was the bug: it
+   * read a display flag as a lifecycle state. Kept as a delegating alias so
+   * 0.6.x callers keep working; it now returns OPEN signals, which is what
+   * every caller meant.
+   */
+  async getUnsurfaced(userId: string, sessionId?: string, limit = 3): Promise<ContradictionSignal[]> {
+    return this.getOpen(userId, sessionId, limit);
+  }
+
+  /**
+   * Record that these signals were shown to the user in this session.
+   *
+   * This writes DISPLAY bookkeeping and nothing else. It used to also flip
+   * `surfaced = TRUE` after two sessions, which was the only exit the queue
+   * had — a signal looked at twice and ignored left by the same door as one
+   * that had been dealt with, and the second door did not exist.
+   *
+   * Shown-twice now takes a HOLD, which is honest about what happened (nobody
+   * decided anything) and, unlike the old permanent flag, lapses the moment the
+   * underlying fact moves. The anti-flood property is kept; the lie is not.
+   */
   async markSurfaced(ids: string[], sessionId: string): Promise<void> {
     if (ids.length === 0) return;
 
@@ -242,12 +311,118 @@ export class ContradictionService {
       await this.pg.query(
         `UPDATE ${this.prefix}contradiction_signals
          SET surfaced_session_ids = array_append(surfaced_session_ids, $1::uuid),
-             surfaced = CASE WHEN array_length(surfaced_session_ids, 1) >= 2 THEN TRUE ELSE surfaced END
+             surfaced = TRUE,
+             status = CASE
+               WHEN status = 'open' AND array_length(surfaced_session_ids, 1) >= 2
+               THEN 'held' ELSE status END,
+             held_at = CASE
+               WHEN status = 'open' AND array_length(surfaced_session_ids, 1) >= 2
+               THEN NOW() ELSE held_at END,
+             hold_reason = CASE
+               WHEN status = 'open' AND array_length(surfaced_session_ids, 1) >= 2
+               THEN 'auto:shown in 3 sessions without a decision' ELSE hold_reason END,
+             held_at_value = CASE
+               WHEN status = 'open' AND array_length(surfaced_session_ids, 1) >= 2
+               THEN stored_value ELSE held_at_value END
          WHERE id = ANY($2::uuid[])`,
         [sessionId, ids]
       );
     } catch (error) {
       this.logger.error('markSurfaced failed', { error: (error as Error).message });
+    }
+  }
+
+  /**
+   * Close a contradiction with a decision. Returns true if a row moved.
+   *
+   * `decision` is required and is the point: it names which value won, so a
+   * downstream reader can act on the outcome. Migration 016 learned this on
+   * fact collisions — a close-out carrying only a free-text note is a mute
+   * dressed as a decision, because nothing can read prose. `note` is where the
+   * prose goes, and it is optional.
+   */
+  async resolve(
+    userId: string,
+    id: string,
+    decision: ContradictionDecision,
+    note?: string,
+  ): Promise<boolean> {
+    if (decision !== 'user_stated' && decision !== 'stored' && decision !== 'neither') {
+      this.logger.warn('resolve rejected: unknown decision', { userId, id, decision });
+      return false;
+    }
+    try {
+      const row = await this.pg.queryOne<{ id: string }>(
+        `UPDATE ${this.prefix}contradiction_signals
+            SET status      = 'resolved',
+                decision    = $3,
+                resolution  = $4,
+                resolved_at = NOW(),
+                held_at       = NULL,
+                hold_reason   = NULL,
+                held_at_value = NULL
+          WHERE id = $2 AND user_id = $1 AND status <> 'resolved'
+      RETURNING id`,
+        [userId, id, decision, note ? note.slice(0, 600) : null],
+      );
+      if (row) this.logger.info('contradiction resolved', { userId, id, decision });
+      return Boolean(row);
+    } catch (error) {
+      this.logger.error('resolve failed', { error: (error as Error).message });
+      return false;
+    }
+  }
+
+  /**
+   * Set a contradiction aside without deciding it. Returns true if a row moved.
+   *
+   * Deliberately separate from {@link resolve} and deliberately not permanent:
+   * the hold is pinned to the fact's current value and lapses when that value
+   * changes. "Not now" and "settled" are different answers and the store should
+   * not be able to confuse them.
+   */
+  async hold(userId: string, id: string, reason?: string): Promise<boolean> {
+    try {
+      const row = await this.pg.queryOne<{ id: string }>(
+        `UPDATE ${this.prefix}contradiction_signals
+            SET status        = 'held',
+                held_at       = NOW(),
+                hold_reason   = $3,
+                held_at_value = stored_value
+          WHERE id = $2 AND user_id = $1 AND status = 'open'
+      RETURNING id`,
+        [userId, id, reason ? reason.slice(0, 300) : null],
+      );
+      return Boolean(row);
+    } catch (error) {
+      this.logger.error('hold failed', { error: (error as Error).message });
+      return false;
+    }
+  }
+
+  /**
+   * Lifecycle counts for a user. `resolved` is now a number that can be
+   * non-zero — before 017 there was no code path that could produce one.
+   */
+  async counts(userId: string): Promise<{ open: number; held: number; resolved: number }> {
+    try {
+      const rows = await this.pg.query<{ status: string; n: string }>(
+        `SELECT status, COUNT(*) AS n
+           FROM ${this.prefix}contradiction_signals
+          WHERE user_id = $1
+          GROUP BY status`,
+        [userId],
+      );
+      const out = { open: 0, held: 0, resolved: 0 };
+      for (const r of rows) {
+        if (r.status === 'open' || r.status === 'held' || r.status === 'resolved') {
+          out[r.status] = Number(r.n);
+        }
+      }
+      return out;
+    } catch (error) {
+      this.logger.error('counts failed', { error: (error as Error).message });
+      return { open: 0, held: 0, resolved: 0 };
     }
   }
 
@@ -341,4 +516,31 @@ export class ContradictionService {
       .map(s => `- ${s.factKey}: user said "${s.userStated}" but stored "${s.storedValue}" (${s.signalType})`)
       .join('\n');
   }
+}
+
+/**
+ * Row -> ContradictionSignal. The lifecycle columns are absent from rows written
+ * before 017 only in the sense that the migration defaulted them; `status` is
+ * NOT NULL with a default, so the fallback here is belt-and-braces for a
+ * consumer querying through an older view.
+ */
+function mapSignal(row: Record<string, unknown>): ContradictionSignal {
+  return {
+    id: row.id as string,
+    userId: row.user_id as string,
+    sessionId: row.session_id as string | undefined,
+    factKey: row.fact_key as string,
+    userStated: row.user_stated as string,
+    storedValue: row.stored_value as string,
+    signalType: row.signal_type as ContradictionSignal['signalType'],
+    status: (row.status as ContradictionStatus) ?? 'open',
+    decision: (row.decision as ContradictionDecision | null) ?? null,
+    resolution: (row.resolution as string | null) ?? null,
+    resolvedAt: row.resolved_at ? new Date(row.resolved_at as string) : null,
+    heldAt: row.held_at ? new Date(row.held_at as string) : null,
+    holdReason: (row.hold_reason as string | null) ?? null,
+    surfaced: row.surfaced as boolean,
+    surfacedSessionIds: (row.surfaced_session_ids as string[]) ?? [],
+    createdAt: row.created_at as Date,
+  };
 }
