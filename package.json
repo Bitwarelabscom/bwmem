@@ -1,6 +1,6 @@
 {
   "name": "@bitwarelabs/bwmem",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Memory SDK for AI chatbots - bi-temporal facts, cross-key collision detection, same-claim merge gates, semantic search, contradiction detection with a real open/held/resolved lifecycle, quality scoring, session texture, self-intentions, multi-stage consolidation",
   "type": "module",
   "main": "dist/index.js",

@@ -177,6 +177,13 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return denom > 0 ? dot / denom : 0;
 }
 
+/**
+ * Ceiling on the text handed to fact extraction. See extractFromMessages: the
+ * prompt is deliberately exhaustive, so output length tracks input length and
+ * an unbounded input cannot be made to fit any output cap.
+ */
+const MAX_EXTRACTION_INPUT_CHARS = 12000;
+
 export class FactsService {
   private pg: PgClient;
   private llm: LLMProvider;
@@ -704,10 +711,20 @@ export class FactsService {
     userId: string,
     _sessionId?: string,
   ): Promise<ExtractedFact[]> {
-    const userMessages = messages
+    // Bounded on purpose. The prompt asks for ALL facts and the output length
+    // therefore scales with the input, so an UNBOUNDED input means an output
+    // no token cap can accommodate — on a corpus with long turns this produced
+    // 28k characters of JSON against an 8k-token ceiling and truncated every
+    // time. Raising the cap alone cannot fix an unbounded input; the input has
+    // to have a ceiling of its own. Newest content is kept, since facts are
+    // most likely to be stated in the turn that triggered extraction.
+    const joined = messages
       .filter(m => m.role === 'user')
       .map(m => m.content)
       .join('\n\n');
+    const userMessages = joined.length > MAX_EXTRACTION_INPUT_CHARS
+      ? joined.slice(-MAX_EXTRACTION_INPUT_CHARS)
+      : joined;
 
     if (!userMessages.trim()) return [];
 
@@ -770,7 +787,7 @@ Return [] if no facts found.`;
       // truncate into partial JSON that the regex below excavated and stored
       // as facts; since 0.7.0 truncation is a hard error instead, so the cap
       // has to fit the real workload rather than the happy path.
-      ], { temperature: 0.1, maxTokens: 8000, json: true });
+      ], { temperature: 0.1, maxTokens: 16000, json: true });
 
       this.logger.debug('Fact extraction LLM response', {
         responseLength: response.length,
