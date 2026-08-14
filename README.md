@@ -69,6 +69,7 @@ long-term-memory benchmark.
 
 | System | Reader | k | Score |
 |---|---|---|---|
+| **bwmem (this package)** | deepseek-v4-flash-0731 | 25 | **71.7%** ‡ |
 | **bwmem's parent stack** | deepseek-v4-pro | 25 | **81.7%** |
 | **bwmem's parent stack** | gpt-4o | 25 | **78.3%** |
 | **bwmem's parent stack** | deepseek-v4-flash | 25 | **70.0%** † |
@@ -77,6 +78,34 @@ long-term-memory benchmark.
 | Zep *(self-reported)* | — | — | 63.8–71.2% |
 | Full-context gpt-4o *(published)* | — | — | ~60% |
 | mem0 *(self-reported)* | — | — | ~49% |
+
+**‡ This is the first row that is actually bwmem.** Every other row is the parent
+stack. It was produced by driving this package through its own public API —
+`startSession` / `recordMessage` / `session.end()` / `buildContext()`, installed
+from npm, no direct SQL — with its shipped defaults and nothing hand-tuned for the
+benchmark. 60 questions, 29,568 turns ingested, 0 empty answers, 0 truncated.
+
+It is **not** a like-for-like win over the 70.0% below it. Read against that run's
+corrected figure (80.8% over the answers it actually produced) bwmem is *behind*,
+and 43-vs-42 is one question — inside the ±2 point error bar either way. The
+readers are also near-neighbours rather than identical, so treat the headline
+numbers as "same range".
+
+The category split is the part worth reading, because it is not noise:
+
+| | bwmem | parent stack |
+|---|---|---|
+| temporal-reasoning | **81.2%** | 62.5% |
+| multi-session | 37.5% | **56.2%** |
+| knowledge-update | 66.7% | 66.7% |
+| single-session (all) | 100% / 100% / 75% | 100% / 100% / 50% |
+
+bwmem is **much better at temporal questions** — that is the `[Timeline]` block,
+which the parent-stack run reached through a hand-written query in the harness and
+bwmem now emits itself. It is **much worse at multi-session questions**, where the
+answer has to be assembled from several conversations. That is the honest weak
+spot: retrieval over per-message embeddings finds the right *turns* but does not
+gather a *conversation*, and it is the obvious next thing to work on.
 
 **† That 70.0% is wrong, and it is wrong in our favour to leave uncorrected.**
 Re-examining the run, **8 of 60 answers came back completely empty** and all 8 were
@@ -134,9 +163,10 @@ on that agent's memory layer — same retrieval architecture (pgvector + bge-m3
 cosine recall over consolidated episodic content), same fact model, same
 consolidation staging. bwmem should land in the same range for that reason.
 
-But it is the parent stack's number, not bwmem's own: **bwmem has not yet been put
-through the harness as a package.** When it is, the result gets published here —
-whatever it says.
+**bwmem has now been put through the harness as a package** — see the 71.7% row and
+its footnote. The adapter that does it drives only the public API, so what it
+measures is what `npm install @bitwarelabs/bwmem` gives you, defaults included.
+The remaining rows are still the parent stack's.
 
 ## Requirements
 
