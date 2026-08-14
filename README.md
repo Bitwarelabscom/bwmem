@@ -634,19 +634,64 @@ const provider = new OpenRouterProvider({
   model: 'anthropic/claude-3.5-haiku',        // default
   embeddingModel: 'qwen/qwen3-embedding-8b',  // default
   embeddingDimensions: 1024,                   // default
+  reasoning: false,                            // default — see below
 });
 ```
+
+### Truncation is an error, not a value
+
+Every provider used to end `chat()` with `?? ''` and throw the finish reason away. That is silent data loss with a very specific shape, and it is worth describing because the same shape will be in your own provider if you wrote one.
+
+A completion that hits its token ceiling comes back as a **prefix** — valid-looking, just cut off — with HTTP 200, a populated `content`, and no error field anywhere. `finish_reason: 'length'` is the only signal the model was still talking. Thirteen call sites in this package run `JSON.parse` on the result, and four of those pull a fragment out with a regex first. A regex is perfectly happy to find a complete-looking object inside an abandoned draft, so a half-finished thought parses clean and gets stored as a finished answer. Nothing errors, and the bad value is now indistinguishable from a good one.
+
+As of 0.7.0 all three providers check the finish reason and throw `TruncatedCompletionError` instead of returning the prefix:
+
+```typescript
+import { TruncatedCompletionError } from '@bitwarelabs/bwmem';
+
+try {
+  await provider.chat(messages, { maxTokens: 200 });
+} catch (err) {
+  if (err instanceof TruncatedCompletionError) {
+    err.partialContent; // what the model managed before it was cut off
+    err.finishReason;   // 'length' | 'max_tokens' | ...
+    err.maxTokens;      // the cap that was hit
+  }
+}
+```
+
+The error is deliberately **not** retryable — the same request with the same cap truncates identically. Raise `maxTokens` or shorten the prompt.
+
+### Reasoning models and small token budgets
+
+Reasoning tokens are emitted **before** any content and count against the same `max_tokens`. Every internal caller here asks for a small, deliberate budget — 30 tokens for an emotion label, 120 for a merge gate, 200 for a quality score — which is correct and cheap on a normal model and produces **nothing at all** on a reasoning one: the budget is spent thinking, and you get `''` with `finish_reason: 'length'`.
+
+None of this package's prompts benefit from reasoning; they are extraction and classification with a fixed output shape. So:
+
+- **OpenRouter** sends `reasoning: { enabled: false }` by default. Much of its free tier is reasoning-first, which is where this bites hardest. Pass `reasoning: true` to opt back in.
+- **Ollama** sends `think` only when you set it explicitly, because Ollama rejects the field on models that do not support thinking. Set `think: false` on a thinking model (deepseek-r1, qwen3, ...).
 
 ### Custom provider
 
 ```typescript
 import type { EmbeddingProvider, LLMProvider } from '@bitwarelabs/bwmem';
+import { assertComplete } from '@bitwarelabs/bwmem';
 
 const myProvider: EmbeddingProvider & LLMProvider = {
   dimensions: 1024,
   async generate(text) { /* return number[] */ },
   async generateBatch(texts) { /* return number[][] */ },
-  async chat(messages, options?) { /* return string */ },
+  async chat(messages, options?) {
+    // ... call your API ...
+    // Run the same guard the bundled providers use: a provider that returns
+    // truncated text silently reintroduces the bug for every caller above it.
+    return assertComplete({
+      provider: 'MyProvider',
+      content: choice.message.content ?? '',
+      finishReason: choice.finish_reason,
+      maxTokens: options?.maxTokens,
+    });
+  },
 };
 ```
 

@@ -1,10 +1,27 @@
 import type { EmbeddingProvider, LLMProvider, ChatMessage, LLMOptions } from '../types.js';
+import { assertComplete } from './completion.js';
 
 interface OpenRouterProviderConfig {
   apiKey: string;
   model?: string;               // Chat model, default: 'anthropic/claude-3.5-haiku'
   embeddingModel?: string;      // default: 'qwen/qwen3-embedding-8b'
   embeddingDimensions?: number; // default: 1024
+  /**
+   * Let the model emit reasoning tokens. Default false, and the default is the
+   * important part.
+   *
+   * OpenRouter fronts a lot of reasoning-first models — most of the free tier is
+   * reasoning-first — and reasoning tokens are billed and emitted BEFORE any
+   * content while counting against the same `max_tokens`. Every internal caller
+   * in this package asks for a small, deliberate budget (30 tokens for an
+   * emotion label, 120 for a merge gate, 200 for a quality score). With
+   * reasoning on, that budget is consumed thinking and the caller gets an empty
+   * string with `finish_reason: 'length'`.
+   *
+   * None of this package's prompts benefit from reasoning: they are extraction
+   * and classification with a fixed output shape. So it is off unless you ask.
+   */
+  reasoning?: boolean;
 }
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
@@ -19,6 +36,7 @@ export class OpenRouterProvider implements EmbeddingProvider, LLMProvider {
   private apiKey: string;
   private model: string;
   private embeddingModel: string;
+  private reasoning: boolean;
   readonly dimensions: number;
 
   constructor(config: OpenRouterProviderConfig) {
@@ -26,6 +44,7 @@ export class OpenRouterProvider implements EmbeddingProvider, LLMProvider {
     this.model = config.model ?? 'anthropic/claude-3.5-haiku';
     this.embeddingModel = config.embeddingModel ?? 'qwen/qwen3-embedding-8b';
     this.dimensions = config.embeddingDimensions ?? 1024;
+    this.reasoning = config.reasoning ?? false;
   }
 
   async generate(text: string): Promise<number[]> {
@@ -74,6 +93,11 @@ export class OpenRouterProvider implements EmbeddingProvider, LLMProvider {
       if (options?.maxTokens) body.max_tokens = options.maxTokens;
       if (options?.json) body.response_format = { type: 'json_object' };
 
+      // Sent unconditionally, including when reasoning is enabled: on a
+      // non-reasoning model this is ignored, and on a reasoning one the
+      // difference between an explicit flag and an omitted one is the whole bug.
+      body.reasoning = { enabled: this.reasoning };
+
       const response = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
         method: 'POST',
         headers: {
@@ -89,10 +113,24 @@ export class OpenRouterProvider implements EmbeddingProvider, LLMProvider {
       }
 
       const data = await response.json() as {
-        choices: Array<{ message: { content: string } }>;
+        choices: Array<{
+          message: { content: string | null };
+          finish_reason?: string | null;
+          // OpenRouter normalises `finish_reason` across upstreams but passes
+          // the provider's own wording through here. Prefer the normalised one;
+          // fall back to native so an unmapped upstream still reports honestly.
+          native_finish_reason?: string | null;
+        }>;
       };
 
-      return data.choices[0]?.message?.content ?? '';
+      const choice = data.choices[0];
+
+      return assertComplete({
+        provider: 'OpenRouter',
+        content: choice?.message?.content ?? '',
+        finishReason: choice?.finish_reason ?? choice?.native_finish_reason,
+        maxTokens: options?.maxTokens,
+      });
     });
   }
 

@@ -1,4 +1,5 @@
 import type { EmbeddingProvider, LLMProvider, ChatMessage, LLMOptions } from '../types.js';
+import { assertComplete } from './completion.js';
 
 interface OpenAIProviderConfig {
   apiKey: string;
@@ -88,9 +89,19 @@ export class OpenAIProvider implements EmbeddingProvider, LLMProvider {
     }
 
     const data = await response.json() as {
-      choices: Array<{ message: { content: string } }>;
+      choices: Array<{
+        message: { content: string | null };
+        finish_reason?: string | null;
+      }>;
     };
 
-    return data.choices[0]?.message?.content ?? '';
+    const choice = data.choices[0];
+
+    return assertComplete({
+      provider: 'OpenAI',
+      content: choice?.message?.content ?? '',
+      finishReason: choice?.finish_reason,
+      maxTokens: options?.maxTokens,
+    });
   }
 }

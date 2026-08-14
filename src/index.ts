@@ -86,6 +86,12 @@ export { isSpeakerFact, isEphemeralFactKey, isVolatileFactKey } from './memory/f
 export { formatRelativeTime } from './utils/time-utils.js';
 export { safeQuery } from './utils/safe-query.js';
 
+// Truncation (0.7.0). Exported from the root, not just the provider subpaths,
+// because a consumer writing its own LLMProvider needs the same guard — a
+// provider that returns truncated text silently reintroduces the bug for every
+// caller in this package.
+export { TruncatedCompletionError, assertComplete } from './providers/completion.js';
+
 // Fact-key guards (0.5.0). isMergeableFactKey is the one the key-axis merge
 // consults; the others are exported because a consumer classifying its own keys
 // needs the same definitions the store uses.
