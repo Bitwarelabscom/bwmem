@@ -199,6 +199,10 @@ const MAX_EXTRACTION_INPUT_CHARS = 12000;
  */
 const MAX_FACTS_PER_EXTRACTION = 25;
 
+/** Mirrors the CHECK constraints in migration 001. Model output must be coerced into these. */
+const VALID_FACT_TYPES = new Set(['permanent', 'default', 'temporary']);
+const VALID_CATEGORIES = new Set(FACT_CATEGORIES);
+
 export class FactsService {
   private pg: PgClient;
   private llm: LLMProvider;
@@ -843,6 +847,22 @@ Return [] if no facts found.`;
         if (typeof f.factValue === 'number') f.factValue = String(f.factValue);
         if (typeof f.category !== 'string' || typeof f.factKey !== 'string'
             || typeof f.factValue !== 'string') return false;
+
+        // The ENUM fields are model output too, and the model invents values —
+        // "ongoing", "recurring", "evolving" for factType, and categories
+        // outside the documented set. Neither was checked, so the row sailed
+        // through extraction and died at the INSERT against
+        // `facts_fact_type_check`, losing the fact and logging a Postgres
+        // constraint error that names the column but not the culprit.
+        //
+        // Coerced, not rejected: an unrecognised lifecycle label is a
+        // formatting miss, not evidence the FACT is wrong, and 'permanent' is
+        // the documented default. An unrecognised category falls back to
+        // 'context', which is the catch-all the prompt already defines.
+        if (!VALID_FACT_TYPES.has(f.factType as string)) f.factType = 'permanent';
+        if (!VALID_CATEGORIES.has(f.category as string)) {
+          f.category = 'context' as ExtractedFact['category'];
+        }
         if (!f.category || !f.factKey || !f.factValue || typeof f.confidence !== 'number') return false;
         if (isSpeculativeFact(f.factValue)) {
           this.logger.warn('Rejected speculative fact', { key: f.factKey });

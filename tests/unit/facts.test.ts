@@ -269,6 +269,34 @@ describe('FactsService', () => {
       expect(out).toHaveLength(0);
     });
 
+    it('coerces an invented factType instead of dying at the INSERT', async () => {
+      // The model returns lifecycle labels the schema has never heard of
+      // ("ongoing", "recurring"). fact_type has a CHECK constraint, so an
+      // unvalidated value passed extraction and then threw a Postgres
+      // constraint error that named the column but not the culprit.
+      llm.respond(JSON.stringify([{
+        category: 'personal', factKey: 'commute', factValue: 'cycles to work',
+        confidence: 0.9, isCorrection: false, factType: 'ongoing',
+      }]));
+      pg.willReturn([]);
+      const out = await facts.extractFromMessages(
+        [{ role: 'user', content: 'I cycle to work most days of the week.' }], 'user-1');
+      expect(out).toHaveLength(1);
+      expect(out[0].factType).toBe('permanent');
+    });
+
+    it('coerces an unknown category to context', async () => {
+      llm.respond(JSON.stringify([{
+        category: 'financial', factKey: 'budget', factValue: 'saving for a house',
+        confidence: 0.9, isCorrection: false, factType: 'permanent',
+      }]));
+      pg.willReturn([]);
+      const out = await facts.extractFromMessages(
+        [{ role: 'user', content: 'I am saving up money for a house deposit.' }], 'user-1');
+      expect(out).toHaveLength(1);
+      expect(out[0].category).toBe('context');
+    });
+
     it('asks for a bounded number of facts', async () => {
       // The prompt used to say "extract ALL facts, thoroughness over brevity",
       // which bounded nothing: 18% of batches ran to the token cap and were
