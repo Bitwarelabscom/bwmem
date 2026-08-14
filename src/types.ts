@@ -397,6 +397,12 @@ export interface MemoryContext {
   sessionTexture?: string;
   /** Oldest open intention, gated to once a day in `options.timezone`. */
   intentionPrompt?: string;
+  /**
+   * `[Timeline]` block from the temporal index — dated events selected
+   * semantically then sorted chronologically. Present only when the query looks
+   * temporal, so absence is the normal case, not a failure.
+   */
+  timeline?: string;
   formatted: string;
   sourcesResponded: string;
 }
@@ -405,9 +411,65 @@ export interface BuildContextOptions {
   query?: string;
   sessionId?: string;
   maxFacts?: number;
+  /**
+   * Recall depth for message search. Default **25**.
+   *
+   * This is the single highest-leverage retrieval parameter and the default is
+   * measured, not guessed: on LongMemEval, k=8 scored 65.0% and k=25 scored
+   * 78.3% with the same reader on the same corpus. Recall depth alone was worth
+   * 13 points. It was 5 before 0.8.0, which is below even the losing arm of that
+   * comparison.
+   */
   maxSimilarMessages?: number;
   maxEmotionalMoments?: number;
+  /**
+   * Cosine floor for message search. Default **0.5**.
+   *
+   * Raised from 0.25 in 0.8.0 to match the benchmarked configuration. At k=25 a
+   * loose floor spends the budget on weak matches; the floor is what makes depth
+   * pay off rather than just adding noise.
+   */
   similarityThreshold?: number;
+  /**
+   * Truncate each recalled message to this many characters. Default **0 = no
+   * truncation**, which is the benchmarked setting.
+   *
+   * This used to be a hardcoded 300 with no way to turn it off. On the benchmark
+   * corpus 58% of stored passages are longer than that, so the majority of what
+   * retrieval found was being cut before the model saw it — and silently, since
+   * the ellipsis looks like a summary rather than a loss. Set a value only if
+   * you are under real prompt-budget pressure, and know it costs recall.
+   */
+  clipRecalledChars?: number;
+  /**
+   * Order recalled messages oldest-first rather than by similarity.
+   * Default **true**.
+   *
+   * Similarity order scatters a conversation across the prompt. Chronological
+   * order lets the reader do date arithmetic and see which of two values came
+   * later, which is most of what temporal and knowledge-update questions ask.
+   */
+  chronologicalRecall?: boolean;
+  /**
+   * Include the `[Timeline]` block from the temporal index. Default **true**.
+   *
+   * Self-gating: emits nothing unless the query actually looks temporal, so it
+   * costs one embedding call and a few hundred characters only on the questions
+   * that need it. Requires `temporalIndex` to be enabled.
+   */
+  includeTimeline?: boolean;
+  /**
+   * Pull every message from the sessions the top hits landed in.
+   * Default **false**, and the default is a measured result, not caution.
+   *
+   * The idea is sound — vector search returns isolated turns and a question like
+   * "who graduated first" needs the conversation around each hit — but on
+   * LongMemEval it LOST 6.6 points (78.3% -> 71.7%) while making the prompt 5.7x
+   * larger and 5x more expensive. The extra turns crowd out the ranked evidence.
+   * Exposed because it may still help on corpora with shorter sessions than the
+   * benchmark's; measure before trusting it.
+   */
+  expandSessions?: number;
   timeoutMs?: number;
   /** Selector for the session-texture source (default: 'default' / 'user'). */
   mode?: string;

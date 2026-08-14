@@ -157,9 +157,47 @@ export class EmbeddingService {
     }
   }
 
-  /** Search for semantically similar messages. */
+  /**
+   * Every message from the sessions named, in chronological order.
+   *
+   * Used by session expansion. Returned with `similarity: 0` because these rows
+   * were not ranked — they are neighbours of something that was, and reporting a
+   * score for them would invent evidence of relevance.
+   */
+  async messagesInSessions(userId: string, sessionIds: string[]): Promise<SimilarMessage[]> {
+    if (sessionIds.length === 0) return [];
+    try {
+      const rows = await this.pg.query<SimilarMessageRow>(
+        `SELECT id, session_id, content, role, 0 AS similarity, created_at
+           FROM ${this.prefix}messages
+          WHERE user_id = $1 AND session_id = ANY($2::uuid[])
+            AND content IS NOT NULL AND content <> ''
+          ORDER BY created_at, id`,
+        [userId, sessionIds],
+      );
+      return rows.map(row => ({
+        messageId: row.id,
+        sessionId: row.session_id,
+        content: row.content,
+        role: row.role,
+        similarity: 0,
+        createdAt: row.created_at,
+      }));
+    } catch (error) {
+      this.logger.error('messagesInSessions failed', { error: (error as Error).message });
+      return [];
+    }
+  }
+
+  /**
+   * Search for semantically similar messages.
+   *
+   * Defaults match the benchmarked configuration (see BuildContextOptions):
+   * depth 25, cosine floor 0.5. They were 5 and 0.25, which is shallower than
+   * the losing arm of the k=8-vs-k=25 comparison.
+   */
   async searchSimilarMessages(
-    userId: string, query: string, limit = 5, threshold = 0.25,
+    userId: string, query: string, limit = 25, threshold = 0.5,
     excludeSessionId?: string,
   ): Promise<SimilarMessage[]> {
     try {

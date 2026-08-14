@@ -31,10 +31,15 @@ describe('ContextBuilder', () => {
     builder = new ContextBuilder(
       pg as never, facts, embedding, emotional, contradictions, behavioral,
       sessionTexture, selfIntention,
+      null, // no temporal index
       null, // no graph
       'bwmem_', mockLogger,
     );
   });
+
+  /** The vector-search statement issued for message recall. */
+  const recallQuery = (pg: MockPgClient) =>
+    pg.queries.find(q => q.text.includes('<=>') && q.text.includes('messages'));
 
   describe('build', () => {
     it('returns memory context with all fields', async () => {
@@ -98,6 +103,108 @@ describe('ContextBuilder', () => {
       const context = await builder.build('user-1', { timeoutMs: 100 });
       expect(context).toBeTruthy();
       expect(context.facts).toBeDefined();
+    });
+  });
+
+  /**
+   * These defaults are measured, not stylistic — see the constants in
+   * context-builder.ts. Asserting them keeps a well-meaning "5 seems safer"
+   * edit from silently costing 13 points.
+   */
+  describe('retrieval defaults match the benchmarked configuration', () => {
+    it('recalls to depth 25, not 5', async () => {
+      for (let i = 0; i < 15; i++) pg.willReturn([]);
+      await builder.build('user-1', { query: 'hiking' });
+      expect(recallQuery(pg)?.params).toContain(25);
+    });
+
+    it('uses a 0.5 cosine floor, not 0.25', async () => {
+      for (let i = 0; i < 15; i++) pg.willReturn([]);
+      await builder.build('user-1', { query: 'hiking' });
+      expect(recallQuery(pg)?.params).toContain(0.5);
+    });
+
+    it('honours explicit overrides', async () => {
+      for (let i = 0; i < 15; i++) pg.willReturn([]);
+      await builder.build('user-1', {
+        query: 'hiking', maxSimilarMessages: 8, similarityThreshold: 0.3,
+      });
+      const p = recallQuery(pg)?.params;
+      expect(p).toContain(8);
+      expect(p).toContain(0.3);
+    });
+
+    it('does not expand sessions by default (expansion measured -6.6 points)', async () => {
+      for (let i = 0; i < 15; i++) pg.willReturn([]);
+      await builder.build('user-1', { query: 'hiking' });
+      expect(pg.queries.some(q => q.text.includes('session_id = ANY'))).toBe(false);
+    });
+  });
+
+  describe('recalled message formatting', () => {
+    const msgRow = (id: string, content: string, iso: string, sim: string) => ({
+      id, session_id: 's1', content, role: 'user', similarity: sim,
+      created_at: new Date(iso),
+    });
+
+    /**
+     * Dispatch on SQL text, not on call order. The sources run under
+     * Promise.allSettled but message recall awaits an embedding first, so its
+     * query is NOT the second one to reach the client — a positional queue
+     * hands the message rows to whichever source happens to query first.
+     */
+    const withMessages = (rows: unknown[]) => {
+      pg.query = async (text: string, params?: unknown[]) => {
+        pg.queries.push({ text, params });
+        const isRecall = text.includes('<=>') && text.includes('messages')
+          && !text.includes('conversation');
+        return (isRecall ? rows : []) as never;
+      };
+    };
+
+    it('does not truncate recalled content by default', async () => {
+      const long = 'x'.repeat(900);
+      withMessages([msgRow('m1', long, '2024-03-01', '0.9')]);
+
+      const ctx = await builder.build('user-1', { query: 'q' });
+      // 58% of real passages exceed 300 chars; clipping them was silent.
+      expect(ctx.formatted).toContain(long);
+      expect(ctx.formatted).not.toContain('…');
+    });
+
+    it('clips only when explicitly asked', async () => {
+      const long = 'y'.repeat(900);
+      withMessages([msgRow('m1', long, '2024-03-01', '0.9')]);
+
+      const ctx = await builder.build('user-1', { query: 'q', clipRecalledChars: 100 });
+      expect(ctx.formatted).toContain('…');
+      expect(ctx.formatted).not.toContain(long);
+    });
+
+    it('orders recalled messages oldest-first, not by similarity', async () => {
+      withMessages([
+        msgRow('m1', 'NEWER-EVENT', '2024-06-01', '0.95'),
+        msgRow('m2', 'OLDER-EVENT', '2024-01-01', '0.60'),
+      ]);
+
+      const ctx = await builder.build('user-1', { query: 'q' });
+      expect(ctx.formatted.indexOf('OLDER-EVENT')).toBeLessThan(
+        ctx.formatted.indexOf('NEWER-EVENT'));
+    });
+
+    it('carries the date inline so the reader can actually order them', async () => {
+      withMessages([msgRow('m1', 'graduated', '2024-03-05', '0.9')]);
+      const ctx = await builder.build('user-1', { query: 'q' });
+      expect(ctx.formatted).toContain('[2024-03-05]');
+    });
+
+    it('prints no match score for unranked expanded rows', async () => {
+      // similarity 0 means "never ranked" — printing "0% match" next to real
+      // evidence reads as a relevance claim the row never made.
+      withMessages([msgRow('m1', 'neighbour turn', '2024-03-05', '0')]);
+      const ctx = await builder.build('user-1', { query: 'q' });
+      expect(ctx.formatted).toContain('neighbour turn');
+      expect(ctx.formatted).not.toContain('0% match');
     });
   });
 });

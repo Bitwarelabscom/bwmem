@@ -169,6 +169,51 @@ await mem.textures.capture(session.id); // anchor for the next session
 await mem.shutdown();
 ```
 
+## What's new in 0.8.0
+
+### Retrieval defaults are now the ones that scored highest
+
+The defaults were conservative round numbers. They are now the benchmarked
+configuration, because a memory SDK whose defaults are worse than its own
+measured best is shipping the wrong thing.
+
+| Setting | Was | Now | Why |
+|---|---|---|---|
+| `maxSimilarMessages` (recall depth) | 5 | **25** | k=8 scored 65.0%, k=25 scored 78.3% — same reader, same corpus. Depth alone was worth 13 points, and 5 is below even the losing arm. |
+| `similarityThreshold` | 0.25 | **0.5** | At depth 25 a loose floor spends the budget on weak matches. The floor is what makes depth pay off instead of adding noise. |
+| clipping of recalled text | 300 chars, hardcoded | **off** (`clipRecalledChars: 0`) | 58% of stored passages are longer than 300 chars, so most of what retrieval found was cut before the model saw it — and the ellipsis reads like a summary rather than a loss. |
+| ordering of recalled text | by similarity | **oldest-first** (`chronologicalRecall`) | Similarity order scatters one conversation across the prompt. Chronological order is what lets a reader tell which of two conflicting values came later. |
+| `[Timeline]` block | not wired in | **on** (`includeTimeline`) | The temporal index existed but was never reachable from `buildContext`. |
+
+Each is overridable per call. If you were relying on the old behaviour, set
+`{ maxSimilarMessages: 5, similarityThreshold: 0.25, clipRecalledChars: 300, chronologicalRecall: false }`.
+
+Recalled messages now carry their date inline (`- [2024-03-05] "..."`), since a
+reader cannot order what it cannot see.
+
+### Session expansion is available and off, and that is a measured result
+
+Pulling every turn of the sessions your top hits landed in is an appealing idea —
+vector search returns isolated turns, and "who graduated first, Emma or Rachel"
+needs the conversation around each hit. On LongMemEval it **lost 6.6 points**
+(78.3% → 71.7%) while making the prompt 5.7× larger and 5× more expensive. The
+extra turns crowd out the ranked evidence.
+
+It is exposed as `expandSessions: N` because it may still pay off on corpora with
+much shorter sessions than the benchmark's. Measure before trusting it.
+
+### The timeline block is wired into `buildContext`
+
+`[Timeline]` selects events semantically, then sorts them chronologically —
+sorting first and taking the top N returns the *oldest* N, which on a real corpus
+is dominated by incidental world facts and evicts the personal events the question
+is about. It self-gates on whether the query looks temporal, so it costs one
+embedding call only on questions that can use it.
+
+In the benchmark's best run this is where the points were: temporal-reasoning
+**93.8%** and knowledge-update **100%**, against 62.5% and 66.7% on a run without
+it.
+
 ## What's new in 0.7.0
 
 ### Contradictions could never be resolved

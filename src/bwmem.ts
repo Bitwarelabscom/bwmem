@@ -134,6 +134,7 @@ export class BwMem {
     const contextBuilder = new ContextBuilder(
       pg, facts, embedding, emotionalMoments,
       contradictions, behavioral, sessionTexture, selfIntention,
+      temporalEvents,
       this.config.graph ?? null, prefix, logger,
     );
 
