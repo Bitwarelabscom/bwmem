@@ -40,6 +40,61 @@ describe('Session', () => {
     );
   });
 
+  describe('bulkImport', () => {
+    /** Build a session with bulkImport on, sharing the same mocks. */
+    const importSession = () => new Session(
+      'session-2', 'user-1', {},
+      pg as never,
+      new EmbeddingService(pg as never, new MockEmbeddingProvider(), 'bwmem_', mockLogger),
+      new SentimentService(llm, mockLogger),
+      new CentroidService(redis as never, mockLogger),
+      new FactsService(pg as never, llm, null, 'bwmem_', mockLogger),
+      new EmotionalMomentsService(pg as never, llm, 'bwmem_', mockLogger),
+      new ContradictionService(pg as never, 'bwmem_', mockLogger),
+      llm, null, null, 'bwmem_', mockLogger,
+      true,
+    );
+
+    it('skips the per-message sentiment LLM call', async () => {
+      // One LLM call on EVERY message is the single largest cost in an import
+      // and nothing in retrieval reads the result.
+      const s = importSession();
+      pg.willReturn([]);
+      const before = llm.chatCalls.length;
+      await s.recordMessage({ role: 'user', content: 'I had a genuinely wonderful afternoon at the lake today.' });
+      await s.flush();
+      expect((llm.chatCalls.length) - before).toBe(0);
+    });
+
+    it('still stores the message and its embedding', async () => {
+      // Embeddings are recall-critical: an import that skipped them would be
+      // fast and useless.
+      const s = importSession();
+      pg.willReturn([]);
+      await s.recordMessage({ role: 'user', content: 'I had a genuinely wonderful afternoon at the lake today.' });
+      await s.flush();
+      expect(pg.queries[0].text).toContain('INSERT INTO bwmem_messages');
+      expect(pg.queries.some(q => q.text.includes('embedding'))).toBe(true);
+    });
+
+    it('writes no sentiment columns', async () => {
+      const s = importSession();
+      pg.willReturn([]);
+      await s.recordMessage({ role: 'user', content: 'I had a genuinely wonderful afternoon at the lake today.' });
+      await s.flush();
+      expect(pg.queries.some(q => q.text.includes('SET sentiment_valence'))).toBe(false);
+    });
+
+    it('live mode still runs sentiment', async () => {
+      pg.willReturn([]);
+      llm.respond('{"valence": 0.2, "arousal": 0.3, "dominance": 0.5}');
+      const before = llm.chatCalls.length;
+      await session.recordMessage({ role: 'user', content: 'I had a genuinely wonderful afternoon at the lake today.' });
+      await session.flush();
+      expect((llm.chatCalls.length) - before).toBeGreaterThan(0);
+    });
+  });
+
   describe('recordMessage timestamps', () => {
     it('defaults created_at to now', async () => {
       pg.willReturn([]);

@@ -219,6 +219,31 @@ export interface ExtractedFact {
 export interface SessionConfig {
   userId: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Backfilling existing history rather than following a live conversation.
+   * Default false.
+   *
+   * The per-message pipeline is built for a live chat, where one extra LLM call
+   * per turn is invisible. Importing a corpus is a different shape: the same
+   * work runs thousands of times in a burst and the LLM calls, not the
+   * database, set the wall clock. Measured on a LongMemEval subset, a live-mode
+   * import ran at 0.42 messages/sec — about six days for that corpus.
+   *
+   * Bulk import keeps everything recall-critical and drops what only serves a
+   * live conversation:
+   *
+   *   kept     embeddings (retrieval depends on them), the session centroid,
+   *            fact extraction, direct-correction contradiction signals, and
+   *            the end-of-session episodic + temporal passes
+   *   skipped  per-message sentiment analysis, emotional-moment capture, and
+   *            LLM behavioural-contradiction detection
+   *
+   * That is roughly a 4x cut in LLM calls per message. The cost is real and
+   * worth stating: imported messages carry no sentiment scores, and no
+   * emotional moments are recorded for them, so a context built over
+   * import-only history has an empty "Recent Emotional Moments" block.
+   */
+  bulkImport?: boolean;
 }
 
 export interface Message {

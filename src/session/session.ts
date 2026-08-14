@@ -26,6 +26,7 @@ export class Session {
   private llm: LLMProvider;
   private scheduler: ConsolidationScheduler | null;
   private temporalEvents: TemporalEventsService | null;
+  private bulkImport: boolean;
   private prefix: string;
   private logger: Logger;
   private messageBuffer: Array<{ role: string; content: string }> = [];
@@ -55,6 +56,7 @@ export class Session {
     llm: LLMProvider, scheduler: ConsolidationScheduler | null,
     temporalEvents: TemporalEventsService | null,
     prefix: string, logger: Logger,
+    bulkImport = false,
   ) {
     this.id = id;
     this.userId = userId;
@@ -69,6 +71,7 @@ export class Session {
     this.llm = llm;
     this.scheduler = scheduler;
     this.temporalEvents = temporalEvents;
+    this.bulkImport = bulkImport;
     this.prefix = prefix;
     this.logger = logger;
   }
@@ -226,11 +229,18 @@ export class Session {
       messageId, this.userId, this.id, content, role,
     );
 
-    // Sentiment (LLM) runs after the embedding is already queryable; update the row.
-    const sentimentResult = await this.sentiment.analyze(content);
-    await this.embedding.updateMessageSentiment(
-      messageId, sentimentResult.valence, sentimentResult.arousal, sentimentResult.dominance,
-    );
+    // Sentiment (LLM) runs after the embedding is already queryable; update the
+    // row. Skipped when backfilling: it is one LLM call on EVERY message, it is
+    // the single largest cost in an import, and nothing in retrieval reads it —
+    // it feeds emotional-moment capture, which bulk import also skips.
+    const sentimentResult = this.bulkImport
+      ? null
+      : await this.sentiment.analyze(content);
+    if (sentimentResult) {
+      await this.embedding.updateMessageSentiment(
+        messageId, sentimentResult.valence, sentimentResult.arousal, sentimentResult.dominance,
+      );
+    }
 
     // Update session centroid, reusing the vector we just computed. This used
     // to call generate() again on the identical string — a second paid
@@ -279,14 +289,21 @@ export class Session {
               }
             }
 
-            // Behavioral contradiction detection via LLM
-            await this.detectBehavioralContradictions(extracted, existingFacts);
+            // Behavioral contradiction detection via LLM. Skipped on import:
+            // another LLM call per extraction batch, and the direct-correction
+            // signals above (pure comparison, no model) still fire.
+            if (!this.bulkImport) {
+              await this.detectBehavioralContradictions(extracted, existingFacts);
+            }
           }
         }
       }
 
-      // Emotional moment capture
-      if (Math.abs(sentimentResult.valence) > 0.5 || sentimentResult.arousal > 0.6) {
+      // Emotional moment capture. Gated on sentiment, so it is inert on an
+      // import anyway — the null check is what makes that explicit rather than
+      // a crash on a missing score.
+      if (sentimentResult
+          && (Math.abs(sentimentResult.valence) > 0.5 || sentimentResult.arousal > 0.6)) {
         await this.emotionalMoments.capture(
           this.userId, this.id, content,
           sentimentResult.valence, sentimentResult.arousal, sentimentResult.dominance,

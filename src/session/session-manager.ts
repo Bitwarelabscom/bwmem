@@ -65,6 +65,7 @@ export class SessionManager {
       this.pg, this.embedding, this.sentiment, this.centroid,
       this.facts, this.emotionalMoments, this.contradictions,
       this.llm, scheduler, this.temporalEvents, this.prefix, this.logger,
+      config.bulkImport === true,
     );
 
     // Set up inactivity timeout
