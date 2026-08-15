@@ -251,7 +251,19 @@ export class ContextBuilder {
     }
     const keep = ordered.slice(0, expandSessions);
     const expanded = await this.embedding.messagesInSessions(userId, keep);
-    return expanded.length > 0 ? expanded : hits;
+    if (expanded.length === 0) return hits;
+
+    // UNION, never replace. This used to return `expanded` alone, on the
+    // reasoning that the ranked rows were already inside it — which is only
+    // true when every hit's session is expanded. With a session cap it is
+    // false, and the effect is severe: at expandSessions=1 every ranked hit
+    // outside the top session was DISCARDED, so whenever the top session was
+    // the wrong one the gold evidence was deleted outright. Measured 60.0%
+    // against 80.0% for no expansion, and — the tell — MORE expansion scored
+    // better than less, which no sane widening should do.
+    const seenIds = new Set(expanded.map(m => m.messageId));
+    const preserved = hits.filter(h => !seenIds.has(h.messageId));
+    return [...expanded, ...preserved];
   }
 
   private format(

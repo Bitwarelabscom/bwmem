@@ -567,10 +567,24 @@ export interface BuildContextOptions {
    * Default **false**, and the default is a measured result, not caution.
    *
    * The idea is sound — vector search returns isolated turns and a question like
-   * "who graduated first" needs the conversation around each hit — but on
-   * LongMemEval it LOST 6.6 points (78.3% -> 71.7%) while making the prompt 5.7x
-   * larger and 5x more expensive. The extra turns crowd out the ranked evidence.
-   * Exposed because it may still help on corpora with shorter sessions than the
+   * "who graduated first" needs the conversation around each hit — and it has
+   * now been measured four ways. It loses every time:
+   *
+   *   none        80.0%      expand 2    74.2%
+   *   expand 1    70.0%      expand 3    75.0%
+   *
+   * (Paired against no expansion over two runs each: expand-1 net -12,
+   * expand-2 net -7.) Adding surrounding turns costs more than it gains, even
+   * when the right session is expanded — the gold session ranks first for 83%
+   * of questions, so this is not a targeting failure.
+   *
+   * Worth knowing WHY, because it explains a lot of neighbouring results:
+   * perfect retrieval (gold sessions only) scores 88.3% on context LARGER than
+   * ours. Oracle's advantage is not that it has whole sessions, it is that it
+   * has ONLY relevant ones. Every mechanism that adds context without being
+   * able to say "and nothing else" loses ground.
+   *
+   * Exposed because it may help on corpora with shorter sessions than the
    * benchmark's; measure before trusting it.
    */
   expandSessions?: number;

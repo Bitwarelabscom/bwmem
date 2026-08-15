@@ -141,6 +141,55 @@ describe('ContextBuilder', () => {
     });
   });
 
+  describe('session expansion', () => {
+    it('preserves ranked hits outside the expanded sessions', async () => {
+      // The bug this guards: expansion used to RETURN the expanded set alone,
+      // discarding every ranked hit whose session did not make the cap. At
+      // expandSessions=1 that deleted the gold evidence whenever the top
+      // session was the wrong one — 60.0% against 80.0% for no expansion.
+      const ranked = [
+        { id: 'm1', session_id: 's1', content: 'top hit', role: 'user',
+          similarity: '0.9', created_at: new Date('2024-01-02') },
+        { id: 'm2', session_id: 's2', content: 'GOLD EVIDENCE', role: 'user',
+          similarity: '0.7', created_at: new Date('2024-01-03') },
+      ];
+      const expandedRows = [
+        { id: 'm1', session_id: 's1', content: 'top hit', role: 'user',
+          similarity: '0', created_at: new Date('2024-01-02') },
+        { id: 'm3', session_id: 's1', content: 'neighbour', role: 'user',
+          similarity: '0', created_at: new Date('2024-01-01') },
+      ];
+      pg.query = async (text: string, params?: unknown[]) => {
+        pg.queries.push({ text, params });
+        if (text.includes('session_id = ANY')) return expandedRows as never;
+        if (text.includes('<=>') && text.includes('messages')
+            && !text.includes('conversation')) return ranked as never;
+        return [] as never;
+      };
+
+      const ctx = await builder.build('user-1', { query: 'q', expandSessions: 1 });
+      // s2 was not expanded, but its ranked hit must survive.
+      expect(ctx.formatted).toContain('GOLD EVIDENCE');
+      expect(ctx.formatted).toContain('neighbour');
+    });
+
+    it('does not duplicate a message present in both sets', async () => {
+      const row = {
+        id: 'm1', session_id: 's1', content: 'SHARED', role: 'user',
+        similarity: '0.9', created_at: new Date('2024-01-02'),
+      };
+      pg.query = async (text: string, params?: unknown[]) => {
+        pg.queries.push({ text, params });
+        if (text.includes('session_id = ANY')) return [{ ...row, similarity: '0' }] as never;
+        if (text.includes('<=>') && text.includes('messages')
+            && !text.includes('conversation')) return [row] as never;
+        return [] as never;
+      };
+      const ctx = await builder.build('user-1', { query: 'q', expandSessions: 1 });
+      expect(ctx.formatted.split('SHARED').length - 1).toBe(1);
+    });
+  });
+
   describe('recalled message formatting', () => {
     const msgRow = (id: string, content: string, iso: string, sim: string) => ({
       id, session_id: 's1', content, role: 'user', similarity: sim,
