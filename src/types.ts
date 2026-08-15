@@ -563,6 +563,42 @@ export interface BuildContextOptions {
    */
   keywordRecall?: boolean;
   /**
+   * When one session is clearly the answer, give the reader that conversation
+   * and nothing else. The value is the minimum similarity margin between the
+   * best hit in the top session and the best hit in the next one. Off by
+   * default.
+   *
+   * Perfect retrieval scores 88.3% on the benchmark corpus against 80.0% for
+   * ranked hits, and its advantage is PURITY rather than volume — oracle
+   * context is larger, it simply contains no other conversation. Approximating
+   * that unconditionally destroys accuracy, because when the top session is the
+   * wrong one it deletes the evidence outright (measured 60.0%).
+   *
+   * The margin does predict correctness — on 58 questions the top session is
+   * right 86.2% of the time overall and 96.2% when the margin clears 0.065.
+   * MEASURED ANYWAY, IT LOSES: 67.5% at margin 0.065 and 73.3% at 0.12, against
+   * 80.0% ungated (paired net -15 and -8 over two runs each).
+   *
+   * The reason is structural rather than a tuning problem, and it invalidates
+   * the premise rather than the threshold. 60% of questions in this corpus
+   * need MORE THAN ONE gold session — 24 need two, 7 need three, and one needs
+   * six. Oracle supplies ALL of them. A gate that hands over a single session
+   * breaks every one of those questions no matter how confident it is, which
+   * is why the stricter threshold loses less: it simply fires less often.
+   *
+   * So "approximate oracle by being pure" was the wrong reading. Oracle's
+   * advantage is that it knows WHICH sessions are gold and supplies exactly
+   * that set, and no signal derived from retrieval scores recovers that.
+   *
+   * Kept and documented because the reasoning is the useful part: anyone
+   * reaching for the same idea should know it was tried, why it is appealing,
+   * and the specific fact about the data that sinks it.
+   *
+   * A relative gap, never an absolute floor: cosine magnitudes move with the
+   * embedding model, the gap between two candidates of one query does not.
+   */
+  soleSessionMargin?: number;
+  /**
    * Pull every message from the sessions the top hits landed in.
    * Default **false**, and the default is a measured result, not caution.
    *

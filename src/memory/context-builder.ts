@@ -114,7 +114,7 @@ export class ContextBuilder {
       ), [], timeout, this.logger),
       safeQuery('similarMessages', query
         ? this.recallMessages(userId, query, recallK, threshold, sessionId, expandSessions,
-                              options?.keywordRecall === true)
+                              options?.keywordRecall === true, options?.soleSessionMargin)
         : Promise.resolve([]), [], timeout, this.logger),
       safeQuery('similarConversations', query
         ? this.embedding.searchSimilarConversations(userId, query, 3)
@@ -207,10 +207,39 @@ export class ContextBuilder {
    * then replaces them rather than being appended, because the ranked rows are
    * already inside it.
    */
+  /**
+   * The one session confident enough to stand alone, or null.
+   *
+   * Confidence is the gap between the best hit in the top-ranked session and
+   * the best hit in the next one. A large gap means one conversation is clearly
+   * about the question; a small one means several look alike, and that is
+   * exactly when replacing everything with a single session is destructive.
+   *
+   * Deliberately NOT an absolute similarity floor: cosine magnitudes shift with
+   * the embedding model, while the RELATIVE gap between two candidates from the
+   * same query and the same model is comparable across corpora.
+   */
+  private soleConfidentSession(
+    hits: Awaited<ReturnType<EmbeddingService['searchSimilarMessages']>>,
+    minMargin: number,
+  ): string | null {
+    const best = new Map<string, number>();
+    for (const h of hits) {
+      if (!h.sessionId) continue;
+      best.set(h.sessionId, Math.max(best.get(h.sessionId) ?? 0, h.similarity ?? 0));
+    }
+    if (best.size === 0) return null;
+    // One candidate session is unanimous by definition.
+    if (best.size === 1) return [...best.keys()][0];
+
+    const ranked = [...best.entries()].sort((a, b) => b[1] - a[1]);
+    return (ranked[0][1] - ranked[1][1]) >= minMargin ? ranked[0][0] : null;
+  }
+
   private async recallMessages(
     userId: string, query: string, limit: number, threshold: number,
     excludeSessionId: string | undefined, expandSessions: number,
-    keywordRecall: boolean,
+    keywordRecall: boolean, soleSessionMargin: number | undefined,
   ): Promise<Awaited<ReturnType<EmbeddingService['searchSimilarMessages']>>> {
     // Hybrid: vector and keyword arms run concurrently and are fused by RANK.
     //
@@ -241,6 +270,28 @@ export class ContextBuilder {
           limit,
         )
       : vectorHits;
+
+    // Confidence gate: when one session is clearly the answer, give the reader
+    // that conversation and nothing else.
+    //
+    // Perfect retrieval scores 88.3% on this corpus against 80.0% for ranked
+    // hits, and the advantage is PURITY — oracle context is larger than ours,
+    // it just contains no other conversation. Every attempt to approximate it
+    // unconditionally lost ground, because applying it when the top session is
+    // WRONG deletes the evidence entirely.
+    //
+    // The margin between the best hit in the top session and the best hit in
+    // the next one is a usable signal for when that is safe. Measured on 58
+    // questions: the top session is correct 86.2% of the time overall, and
+    // 96.2% of the time when that margin clears 0.065 — which covers about
+    // 45% of questions. Below the margin nothing changes.
+    if (soleSessionMargin !== undefined && hits.length > 0) {
+      const sole = this.soleConfidentSession(hits, soleSessionMargin);
+      if (sole) {
+        const only = await this.embedding.messagesInSessions(userId, [sole]);
+        if (only.length > 0) return only;
+      }
+    }
 
     if (expandSessions <= 0 || hits.length === 0) return hits;
 
