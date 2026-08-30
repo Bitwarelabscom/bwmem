@@ -406,6 +406,76 @@ export class EmbeddingService {
     }
   }
 
+  /**
+   * Fetch adjacent turns (before and after) for the provided message hits
+   * within the same session. Captures surrounding conversational dialogue
+   * (e.g. Q&A pairs) without inflating the context to full sessions.
+   */
+  async fetchAdjacentMessages(
+    userId: string,
+    hits: Array<{ sessionId?: string; createdAt?: Date | string; messageId?: string }>,
+    windowTurns = 1,
+  ): Promise<SimilarMessage[]> {
+    if (windowTurns <= 0 || !hits.length) return [];
+
+    const validHits = hits.filter(h => h.sessionId && h.createdAt);
+    if (!validHits.length) return [];
+
+    const sessionIds = validHits.map(h => h.sessionId);
+    const createdAts = validHits.map(h =>
+      h.createdAt instanceof Date ? h.createdAt.toISOString() : String(h.createdAt)
+    );
+
+    try {
+      const rows = await this.pg.query<SimilarMessageRow>(
+        `WITH hits AS (
+           SELECT unnest($1::uuid[]) AS session_id, unnest($2::timestamptz[]) AS created_at
+         ),
+         adjacent_before AS (
+           SELECT m.id, m.session_id, m.content, m.role, m.created_at, 0.0::real as similarity
+           FROM hits h
+           CROSS JOIN LATERAL (
+             SELECT id, session_id, content, role, created_at
+             FROM ${this.prefix}messages
+             WHERE user_id = $3 AND session_id = h.session_id AND created_at < h.created_at
+             ORDER BY created_at DESC
+             LIMIT $4
+           ) m
+         ),
+         adjacent_after AS (
+           SELECT m.id, m.session_id, m.content, m.role, m.created_at, 0.0::real as similarity
+           FROM hits h
+           CROSS JOIN LATERAL (
+             SELECT id, session_id, content, role, created_at
+             FROM ${this.prefix}messages
+             WHERE user_id = $3 AND session_id = h.session_id AND created_at > h.created_at
+             ORDER BY created_at ASC
+             LIMIT $4
+           ) m
+         )
+         SELECT DISTINCT ON (id) id, session_id, content, role, created_at, similarity
+         FROM (
+           SELECT * FROM adjacent_before
+           UNION ALL
+           SELECT * FROM adjacent_after
+         ) combined`,
+        [sessionIds, createdAts, userId, windowTurns],
+      );
+
+      return rows.map(row => ({
+        messageId: row.id,
+        sessionId: row.session_id,
+        content: row.content,
+        role: row.role,
+        similarity: 0,
+        createdAt: row.created_at,
+      }));
+    } catch (error) {
+      this.logger.error('fetchAdjacentMessages failed', { error: (error as Error).message });
+      return [];
+    }
+  }
+
   private async generateInternal(text: string, cacheKey: string): Promise<number[]> {
     const embedding = await this.provider.generate(text.slice(0, MAX_INPUT_CHARS));
     this.cache.set(cacheKey, { embedding, timestamp: Date.now() });
@@ -431,3 +501,37 @@ export class EmbeddingService {
     }
   }
 }
+
+/**
+ * Diversify candidate messages across sessions so no single session dominates the quota.
+ */
+export function diversifyBySession<T extends { sessionId?: string }>(
+  hits: T[],
+  limit: number,
+  maxPerSession = 4,
+): T[] {
+  if (hits.length <= limit && maxPerSession <= 0) return hits;
+  const counts = new Map<string, number>();
+  const selected: T[] = [];
+  const deferred: T[] = [];
+
+  for (const h of hits) {
+    const sid = h.sessionId || '__no_session__';
+    const c = counts.get(sid) ?? 0;
+    if (maxPerSession > 0 && c >= maxPerSession) {
+      deferred.push(h);
+    } else {
+      counts.set(sid, c + 1);
+      selected.push(h);
+      if (selected.length >= limit) return selected;
+    }
+  }
+
+  for (const h of deferred) {
+    selected.push(h);
+    if (selected.length >= limit) break;
+  }
+
+  return selected;
+}
+

@@ -255,5 +255,26 @@ describe('ContextBuilder', () => {
       expect(ctx.formatted).toContain('neighbour turn');
       expect(ctx.formatted).not.toContain('0% match');
     });
+
+    it('formats relevant conversation summaries when available', async () => {
+      pg.query = async (text: string, params?: unknown[]) => {
+        pg.queries.push({ text, params });
+        if (text.includes('bwmem_conversation_summaries')) {
+          return [{
+            session_id: 's1',
+            summary: 'User discussed collecting rare items and books',
+            topics: ['rare items', 'books'],
+            similarity: '0.82',
+            created_at: new Date('2024-03-01'),
+          }] as never;
+        }
+        return [] as never;
+      };
+
+      const ctx = await builder.build('user-1', { query: 'q' });
+      expect(ctx.formatted).toContain('## Relevant Past Conversations');
+      expect(ctx.formatted).toContain('User discussed collecting rare items and books');
+      expect(ctx.formatted).toContain('(Topics: rare items, books)');
+    });
   });
 });

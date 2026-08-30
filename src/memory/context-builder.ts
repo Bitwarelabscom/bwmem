@@ -11,6 +11,7 @@ import type { GraphPlugin, Logger, MemoryContext, BuildContextOptions, EpisodicP
 import { safeQuery } from '../utils/safe-query.js';
 import { classifyRetrieval } from './retrieval-profile.js';
 import { fuseByRank } from './rank-fusion.js';
+import { diversifyBySession } from './embedding.service.js';
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
@@ -89,14 +90,19 @@ export class ContextBuilder {
     // it. A fixed depth is wrong for half the workload in opposite directions:
     // widening is worth +31 points on multi-session questions and costs 12 on
     // temporal ones. See retrieval-profile.ts for the measurements.
-    const profile = query && options?.adaptiveRetrieval === true
+    const profile = query && options?.adaptiveRetrieval !== false
       ? classifyRetrieval(query)
       : null;
     const recallK = options?.maxSimilarMessages ?? profile?.limit ?? DEFAULT_RECALL_K;
     const threshold = options?.similarityThreshold ?? profile?.threshold ?? DEFAULT_SIMILARITY_THRESHOLD;
+    const sessionDiversify = options?.sessionDiversify ?? profile?.sessionDiversify ?? false;
+    const maxPerSession = options?.maxPerSession ?? 4;
+    const windowTurns = options?.windowTurns ?? profile?.windowTurns ?? 0;
+    const includeSummaries = options?.includeSummaries !== false;
     if (profile) {
       this.logger.debug('retrieval profile', {
         intent: profile.intent, reason: profile.reason, k: recallK, threshold,
+        sessionDiversify, maxPerSession, windowTurns,
       });
     }
     const includeTimeline = options?.includeTimeline !== false;
@@ -114,9 +120,10 @@ export class ContextBuilder {
       ), [], timeout, this.logger),
       safeQuery('similarMessages', query
         ? this.recallMessages(userId, query, recallK, threshold, sessionId, expandSessions,
-                              options?.keywordRecall === true, options?.soleSessionMargin)
+                              options?.keywordRecall === true, options?.soleSessionMargin,
+                              sessionDiversify, maxPerSession, windowTurns)
         : Promise.resolve([]), [], timeout, this.logger),
-      safeQuery('similarConversations', query
+      safeQuery('similarConversations', query && includeSummaries
         ? this.embedding.searchSimilarConversations(userId, query, 3)
         : Promise.resolve([]), [], timeout, this.logger),
       safeQuery('emotionalMoments', this.emotionalMoments.getRecent(userId, 7, options?.maxEmotionalMoments ?? 5), [], timeout, this.logger),
@@ -171,7 +178,7 @@ export class ContextBuilder {
     const total = results.length;
 
     const formatted = this.format(
-      factsResult, similarMessages, emotionalMoments, contradictionsList,
+      factsResult, similarMessages, similarConversations, emotionalMoments, contradictionsList,
       behavioralObs, episodicPatterns, semanticKnowledge, graphContext,
       textureBlock, intentionBlock, timelineBlock,
       options?.clipRecalledChars ?? DEFAULT_CLIP_CHARS,
@@ -240,56 +247,49 @@ export class ContextBuilder {
     userId: string, query: string, limit: number, threshold: number,
     excludeSessionId: string | undefined, expandSessions: number,
     keywordRecall: boolean, soleSessionMargin: number | undefined,
+    sessionDiversify = false, maxPerSession = 4, windowTurns = 0,
   ): Promise<Awaited<ReturnType<EmbeddingService['searchSimilarMessages']>>> {
-    // Hybrid: vector and keyword arms run concurrently and are fused by RANK.
-    //
-    // Vector-only recall was the root of the precision/recall bind — tighten
-    // the cosine floor and multi-session questions starve, loosen it and
-    // single-turn questions drown. Both arms of that trade come from ranking on
-    // one signal. Keyword recall catches what embeddings are worst at: rare
-    // literal tokens, proper nouns, model numbers, coined spellings.
-    //
-    // The keyword arm is additive and failure-isolated — it returns [] on any
-    // error, which degrades to exactly the previous vector-only behaviour.
+    // If sessionDiversify is on, fetch more candidates from vector/keyword search
+    // to give diversification room across distinct sessions, then filter down to `limit`.
+    const fetchLimit = sessionDiversify ? Math.max(limit, limit * 2) : limit;
+
     const [vectorHits, keywordHits] = await Promise.all([
-      this.embedding.searchSimilarMessages(userId, query, limit, threshold, excludeSessionId),
+      this.embedding.searchSimilarMessages(userId, query, fetchLimit, threshold, excludeSessionId),
       keywordRecall
-        ? this.embedding.searchMessagesByKeyword(userId, query, limit, excludeSessionId)
+        ? this.embedding.searchMessagesByKeyword(userId, query, fetchLimit, excludeSessionId)
         : Promise.resolve([]),
     ]);
 
-    // Vector arm first: it decides ties, and it carries the real similarity
-    // scores that the prompt renders.
-    // Keyword arm weighted below the vector arm. It is a supplement for rare
-    // literal tokens, not a co-equal channel: at weight 1 a row only IT liked
-    // could outrank one both arms liked, which is how the first version
-    // displaced good rows out of the fused top-N.
-    const hits = keywordHits.length > 0
+    let hits = keywordHits.length > 0
       ? fuseByRank(
           [{ items: vectorHits, weight: 1 }, { items: keywordHits, weight: KEYWORD_ARM_WEIGHT }],
-          limit,
+          fetchLimit,
         )
       : vectorHits;
 
+    if (sessionDiversify && hits.length > 0) {
+      hits = diversifyBySession(hits, limit, maxPerSession);
+    } else if (hits.length > limit) {
+      hits = hits.slice(0, limit);
+    }
+
     // Confidence gate: when one session is clearly the answer, give the reader
     // that conversation and nothing else.
-    //
-    // Perfect retrieval scores 88.3% on this corpus against 80.0% for ranked
-    // hits, and the advantage is PURITY — oracle context is larger than ours,
-    // it just contains no other conversation. Every attempt to approximate it
-    // unconditionally lost ground, because applying it when the top session is
-    // WRONG deletes the evidence entirely.
-    //
-    // The margin between the best hit in the top session and the best hit in
-    // the next one is a usable signal for when that is safe. Measured on 58
-    // questions: the top session is correct 86.2% of the time overall, and
-    // 96.2% of the time when that margin clears 0.065 — which covers about
-    // 45% of questions. Below the margin nothing changes.
     if (soleSessionMargin !== undefined && hits.length > 0) {
       const sole = this.soleConfidentSession(hits, soleSessionMargin);
       if (sole) {
         const only = await this.embedding.messagesInSessions(userId, [sole]);
         if (only.length > 0) return only;
+      }
+    }
+
+    // Local dialogue windowing (±windowTurns surrounding turns in the same session)
+    if (windowTurns > 0 && hits.length > 0) {
+      const adjacent = await this.embedding.fetchAdjacentMessages(userId, hits, windowTurns);
+      if (adjacent.length > 0) {
+        const seenIds = new Set(hits.map(h => h.messageId));
+        const newAdjacent = adjacent.filter(a => !seenIds.has(a.messageId));
+        hits = [...hits, ...newAdjacent];
       }
     }
 
@@ -304,14 +304,6 @@ export class ContextBuilder {
     const expanded = await this.embedding.messagesInSessions(userId, keep);
     if (expanded.length === 0) return hits;
 
-    // UNION, never replace. This used to return `expanded` alone, on the
-    // reasoning that the ranked rows were already inside it — which is only
-    // true when every hit's session is expanded. With a session cap it is
-    // false, and the effect is severe: at expandSessions=1 every ranked hit
-    // outside the top session was DISCARDED, so whenever the top session was
-    // the wrong one the gold evidence was deleted outright. Measured 60.0%
-    // against 80.0% for no expansion, and — the tell — MORE expansion scored
-    // better than less, which no sane widening should do.
     const seenIds = new Set(expanded.map(m => m.messageId));
     const preserved = hits.filter(h => !seenIds.has(h.messageId));
     return [...expanded, ...preserved];
@@ -320,6 +312,7 @@ export class ContextBuilder {
   private format(
     facts: Awaited<ReturnType<FactsService['getUserFacts']>>,
     similarMessages: Awaited<ReturnType<EmbeddingService['searchSimilarMessages']>>,
+    similarConversations: Awaited<ReturnType<EmbeddingService['searchSimilarConversations']>>,
     emotionalMoments: Awaited<ReturnType<EmotionalMomentsService['getRecent']>>,
     contradictions: Awaited<ReturnType<ContradictionService['getOpen']>>,
     behavioral: Awaited<ReturnType<BehavioralService['getActive']>>,
@@ -343,6 +336,20 @@ export class ContextBuilder {
 
     if (facts.length > 0) {
       sections.push(`## Known Facts\n${this.facts.formatForPrompt(facts)}`);
+    }
+
+    if (similarConversations.length > 0) {
+      const convs = similarConversations
+        .filter(c => c.summary && c.summary.trim().length > 0)
+        .map(c => {
+          const when = c.createdAt ? `[${new Date(c.createdAt).toISOString().slice(0, 10)}] ` : '';
+          const topics = c.topics && c.topics.length > 0 ? ` (Topics: ${c.topics.join(', ')})` : '';
+          return `- ${when}${c.summary}${topics}`;
+        })
+        .join('\n');
+      if (convs.length > 0) {
+        sections.push(`## Relevant Past Conversations\n${convs}`);
+      }
     }
 
     if (similarMessages.length > 0) {

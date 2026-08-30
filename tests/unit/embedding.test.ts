@@ -140,4 +140,56 @@ describe('EmbeddingService', () => {
       expect(pg.lastQuery).toContain('bwmem_conversation_summaries');
     });
   });
+
+  describe('fetchAdjacentMessages', () => {
+    it('returns empty array when windowTurns is 0 or hits are empty', async () => {
+      const res1 = await service.fetchAdjacentMessages('user-1', [], 1);
+      expect(res1).toEqual([]);
+
+      const res2 = await service.fetchAdjacentMessages('user-1', [{ sessionId: 's1', createdAt: new Date() }], 0);
+      expect(res2).toEqual([]);
+    });
+
+    it('queries adjacent messages with LATERAL join', async () => {
+      pg.willReturn([{
+        id: 'msg-adj-1',
+        session_id: 'sess-1',
+        content: 'adjacent turn',
+        role: 'assistant',
+        created_at: new Date('2026-03-01T10:01:00Z'),
+        similarity: 0,
+      }]);
+
+      const hits = [{
+        sessionId: 'sess-1',
+        createdAt: new Date('2026-03-01T10:00:00Z'),
+        messageId: 'msg-1',
+      }];
+
+      const res = await service.fetchAdjacentMessages('user-1', hits, 1);
+      expect(pg.lastQuery).toContain('CROSS JOIN LATERAL');
+      expect(res).toHaveLength(1);
+      expect(res[0].content).toBe('adjacent turn');
+    });
+  });
+});
+
+import { diversifyBySession } from '../../src/memory/embedding.service.js';
+
+describe('diversifyBySession', () => {
+  it('caps messages per session and backfills', () => {
+    const hits = [
+      { sessionId: 's1', id: 'm1' },
+      { sessionId: 's1', id: 'm2' },
+      { sessionId: 's1', id: 'm3' },
+      { sessionId: 's1', id: 'm4' },
+      { sessionId: 's1', id: 'm5' },
+      { sessionId: 's2', id: 'm6' },
+      { sessionId: 's3', id: 'm7' },
+    ];
+
+    // With maxPerSession=2 and limit=4: should take 2 from s1, 1 from s2, 1 from s3
+    const diversified = diversifyBySession(hits, 4, 2);
+    expect(diversified.map(h => h.id)).toEqual(['m1', 'm2', 'm6', 'm7']);
+  });
 });

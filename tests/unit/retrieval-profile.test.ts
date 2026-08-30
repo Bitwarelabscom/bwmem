@@ -15,14 +15,21 @@ describe('classifyRetrieval', () => {
       ['Where do I live now that things changed?', 'knowledge-update'],
       ['How many occasions did I travel for work?', 'recurrence'],
       ['What do I usually do on weekends?', 'pattern'],
+      ['How many plants did I acquire in the last month?', 'aggregation'],
+      ['How many total pieces of writing have I completed since I started writing again?', 'aggregation'],
+      ['How much total money did I spend on attending workshops in the last four months?', 'aggregation'],
+      ['How many graduation ceremonies have I attended in the past three months?', 'aggregation'],
+      ['How many rare items do I have in total?', 'aggregation'],
     ])('%s -> gather', (q) => {
       expect(classifyRetrieval(q).intent).toBe('gather');
     });
 
-    it('widens depth and loosens the floor', () => {
+    it('widens depth, loosens floor, and enables session diversification and windowing', () => {
       const p = classifyRetrieval('How many times did I go to Berlin?');
       expect(p.limit).toBe(200);
       expect(p.threshold).toBe(0.35);
+      expect(p.sessionDiversify).toBe(true);
+      expect(p.windowTurns).toBe(1);
     });
   });
 
@@ -33,6 +40,10 @@ describe('classifyRetrieval', () => {
       'Where did I say the keys were?',
       'What did the doctor tell me about my knee?',
       'Which hotel did I book in Lisbon?',
+      'How many days ago did I attend a networking event?',
+      'How many weeks have I been taking sculpting classes?',
+      'How long did Alex marinate the BBQ ribs in special sauce?',
+      'Who graduated first, second and third among Emma, Rachel and Alex?',
     ])('%s -> pinpoint', (q) => {
       expect(classifyRetrieval(q).intent).toBe('pinpoint');
     });

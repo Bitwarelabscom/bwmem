@@ -36,35 +36,43 @@
  */
 export type RetrievalIntent = 'gather' | 'pinpoint';
 
-/**
- * Temporal phrasing overlaps heavily with aggregation phrasing — "how many
- * months since I moved" is both "how many" and a date calculation — and the two
- * want OPPOSITE depths: temporal scored 81.2% tight and 68.8% wide.
- *
- * Checked BEFORE the gather patterns for exactly that reason. Routing temporal
- * questions on their "how many" alone sent 10 of 16 the wrong way.
- */
-const TEMPORAL_PATTERN =
-  /\b(first|last|earliest|latest|earlier|later|before|after|order|when|how long|how many (days|weeks|months|years)|ago|since|between|most recent|oldest|newest|what year|what month|which day)\b/i;
-
 export interface RetrievalProfile {
   intent: RetrievalIntent;
   limit: number;
   threshold: number;
+  sessionDiversify: boolean;
+  windowTurns: number;
   /** Which rule fired, for logging and for explaining a surprising context. */
   reason: string;
 }
 
 /**
- * Questions whose answer is assembled from several conversations: counting,
- * aggregating, comparing, or tracking something that changed over time.
- *
- * Knowledge-update lives here too and the measurement says so (66.7% -> 77.8%
- * when the net widens): deciding what is CURRENTLY true means finding every
- * time the user said something about it, not just the best-matching one.
+ * Pure temporal duration/elapsed-time questions. These need pinpoint date calculations.
+ */
+const TEMPORAL_DURATION_PATTERN =
+  /\b(how many (days|weeks|months|years|hours|minutes|seconds)|how long|how much time)\b/i;
+
+/**
+ * Aggregation / enumeration questions. Even if bounded by time windows ('in the last month', 'since'),
+ * counting non-time entities across conversations requires gathering across sessions.
+ */
+const AGGREGATION_PATTERN =
+  /\b(how many|how often|how much|total|altogether|count|number of)\b/i;
+
+/**
+ * Pure temporal point / ordering patterns without aggregation.
+ */
+const TEMPORAL_ORDER_PATTERN =
+  /\b(first|earliest|latest|earlier|later|before|after|order|most recent|oldest|newest|what year|what month|which day)\b/i;
+const TEMPORAL_AGO_PATTERN =
+  /\b(days|weeks|months|years)\s+ago\b/i;
+const TEMPORAL_WHEN_PATTERN =
+  /^\s*when\b/i;
+
+/**
+ * Other multi-session gather patterns: enumeration, comparison, knowledge-update, etc.
  */
 const GATHER_PATTERNS: Array<[RegExp, string]> = [
-  [/\b(how many|how often|how much|total|altogether|count|number of)\b/i, 'aggregation'],
   [/\b(all|every|each|both|list|which ones|what are)\b/i, 'enumeration'],
   [/\b(compare|comparison|versus|vs\.?|difference between|more than|less than|most|least|fewest)\b/i, 'comparison'],
   [/\b(still|anymore|any more|no longer|these days|nowadays|currently|now that|updated?|changed?|switch(ed)?|move[ds]?)\b/i, 'knowledge-update'],
@@ -73,16 +81,14 @@ const GATHER_PATTERNS: Array<[RegExp, string]> = [
 ];
 
 /**
- * Defaults for each intent, from the table above.
+ * Defaults for each intent.
  *
- * `pinpoint` keeps the 0.5 floor, which scored best on temporal and
- * single-session. `gather` uses 0.35 rather than 0.20: both scored 75.0%
- * overall, but 0.35 was better on the category that motivates widening at all
- * (68.8% vs 56.2% multi-session) and sends ~20% less context.
+ * `pinpoint` keeps the 0.5 floor and tight depth, with no diversification or window expansion.
+ * `gather` uses 0.35 floor, depth 200, session diversification and ±1 turn dialogue windowing.
  */
-const PROFILES: Record<RetrievalIntent, { limit: number; threshold: number }> = {
-  pinpoint: { limit: 25, threshold: 0.5 },
-  gather: { limit: 200, threshold: 0.35 },
+const PROFILES: Record<RetrievalIntent, { limit: number; threshold: number; sessionDiversify: boolean; windowTurns: number }> = {
+  pinpoint: { limit: 25, threshold: 0.5, sessionDiversify: false, windowTurns: 0 },
+  gather: { limit: 200, threshold: 0.35, sessionDiversify: true, windowTurns: 1 },
 };
 
 /**
@@ -93,17 +99,33 @@ const PROFILES: Record<RetrievalIntent, { limit: number; threshold: number }> = 
  * asked for by something in the question, not assumed.
  */
 export function classifyRetrieval(query: string): RetrievalProfile {
-  // Temporal first. It shares vocabulary with aggregation and wants the
-  // opposite treatment, so whichever is tested first decides — and the
-  // measurement says temporal should win.
-  if (TEMPORAL_PATTERN.test(query)) {
-    return { intent: 'pinpoint', ...PROFILES.pinpoint, reason: 'temporal' };
+  // 1. Pure temporal duration/elapsed-time first ('how many days/weeks/months/years', 'how long').
+  if (TEMPORAL_DURATION_PATTERN.test(query)) {
+    return { intent: 'pinpoint', ...PROFILES.pinpoint, reason: 'temporal-duration' };
   }
 
+  // 2. Aggregations (how many items/places, total money/views, etc.) -> gather.
+  if (AGGREGATION_PATTERN.test(query)) {
+    return { intent: 'gather', ...PROFILES.gather, reason: 'aggregation' };
+  }
+
+  // 3. Pure ordering / point-in-time questions.
+  if (TEMPORAL_ORDER_PATTERN.test(query)) {
+    return { intent: 'pinpoint', ...PROFILES.pinpoint, reason: 'temporal-order' };
+  }
+  if (TEMPORAL_AGO_PATTERN.test(query)) {
+    return { intent: 'pinpoint', ...PROFILES.pinpoint, reason: 'temporal-ago' };
+  }
+  if (TEMPORAL_WHEN_PATTERN.test(query)) {
+    return { intent: 'pinpoint', ...PROFILES.pinpoint, reason: 'temporal-when' };
+  }
+
+  // 4. Other gather patterns (enumeration, comparison, knowledge-update, etc.).
   for (const [pattern, reason] of GATHER_PATTERNS) {
     if (pattern.test(query)) {
       return { intent: 'gather', ...PROFILES.gather, reason };
     }
   }
+
   return { intent: 'pinpoint', ...PROFILES.pinpoint, reason: 'default' };
 }

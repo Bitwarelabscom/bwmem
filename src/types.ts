@@ -624,6 +624,25 @@ export interface BuildContextOptions {
    * benchmark's; measure before trusting it.
    */
   expandSessions?: number;
+  /**
+   * When true, diversifies retrieved messages across distinct sessions so that
+   * no single session monopolizes the retrieved message slots.
+   * Activated by default under the `gather` profile.
+   */
+  sessionDiversify?: boolean;
+  /**
+   * Maximum messages allowed per session during diversified retrieval. Default 4.
+   */
+  maxPerSession?: number;
+  /**
+   * Fetch this many adjacent turns before and after each retrieved message
+   * within the same session. Default 0 (1 under `gather` profile).
+   */
+  windowTurns?: number;
+  /**
+   * Include relevant conversation summaries in the prompt context. Default true.
+   */
+  includeSummaries?: boolean;
   timeoutMs?: number;
   /** Selector for the session-texture source (default: 'default' / 'user'). */
   mode?: string;
