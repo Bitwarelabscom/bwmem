@@ -10,14 +10,19 @@ Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: bi-tempo
 
 Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, response quality scoring, and long-term memory consolidation in the background.
 
-**v0.11.0 — multi-session synthesis solved (85.0% on LongMemEval), dynamic gather routing, session diversification, and lateral dialogue turn windowing.**
+**v0.11.1 — subject boundary enforcement, anti-meta filtering, situational directive gating, and 85.0% LongMemEval multi-session synthesis.**
 Earlier releases hit a ceiling on multi-session aggregation: questions requiring synthesis across several distinct conversations suffered from session crowding (one verbose thread monopolizing candidate slots) and context fragmentation (single turns stripped of surrounding dialogue).
 
-v0.11.0 fixes this with four architectural pillars:
+v0.11.0 resolved this with four architectural pillars:
 1. **Intent-Aware Gather Routing**: Compound aggregations and multi-session queries dynamically route to wide-recall passes ($k=200, \text{similarity floor}=0.35$), while pure temporal ordering preserves tight precision ($k=25, \text{floor}=0.5$).
 2. **Session Diversification**: Candidate quotas cap single-session dominance (default max 4–5 turns per session) so evidence from all relevant conversations reaches the prompt.
 3. **Lateral Dialogue Turn Windowing**: Surfaces immediate $\pm 1$ adjacent turns around semantic hits via lateral SQL joins, restoring conversational context without full-session distractor bloat.
 4. **Relevant Conversation Summaries**: Surfaces macro session abstracts from `bwmem_conversation_summaries` alongside granular turns, giving high-level intent alignment on preference queries.
+
+v0.11.1 strengthens memory extraction and gating integrity with:
+1. **Subject Boundary Enforcement**: Isolates human user memory from assistant persona, model capabilities, or architecture details.
+2. **Anti-Meta-Commentary Filtering**: Programmatic filter (`isMetaCommentaryFact`) and prompt guards dropping tool retrieval and search diagnostics before persistence.
+3. **Situational Directive Gating**: DeMem merge gate classifies temporary operational commands as `different_question`, preventing false contradictions against durable policies.
 
 On the 60-question LongMemEval_S benchmark evaluated on byte-identical retrieved context with the strict open-weights judge (`inclusionai/ling-3.0-flash`), Multi-Session accuracy doubled to **68.8%–75.0%**, lifting overall accuracy to **85.0% (51/60)** on `qwen/qwen3.8-max` (86.4% on completed answers) and **81.7%** on `glm-5.3` and `gemini-3.7-flash`.
 
