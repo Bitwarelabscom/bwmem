@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { FactsService } from '../../src/memory/facts.service.js';
+import { FactsService, isMetaCommentaryFact } from '../../src/memory/facts.service.js';
 import { MockPgClient, MockLLMProvider, mockLogger } from '../fixtures/mock-providers.js';
 
 describe('FactsService', () => {
@@ -306,6 +306,65 @@ describe('FactsService', () => {
       await facts.extractFromMessages(
         [{ role: 'user', content: 'Something reasonably long to extract from.' }], 'user-1');
       expect(llm.lastSystemPrompt).toContain('AT MOST 25 facts');
+    });
+
+    it('includes user subject boundary and anti-meta commentary in prompt', async () => {
+      llm.respond('[]');
+      pg.willReturn([
+        {
+          id: 'fact-1',
+          user_id: 'user-1',
+          category: 'personal',
+          fact_key: 'age',
+          fact_value: '35',
+          confidence: '1.0',
+          fact_status: 'active',
+          fact_type: 'permanent',
+          mention_count: 1,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      ]);
+      await facts.extractFromMessages(
+        [{ role: 'user', content: 'Testing subject boundary instructions.' }], 'user-1');
+      expect(llm.lastSystemPrompt).toContain('The human user is the subject');
+      expect(llm.lastSystemPrompt).toContain('NEVER extract facts about the AI assistant');
+      expect(llm.lastSystemPrompt).toContain('NEVER extract meta-commentary about system tools');
+      expect(llm.lastSystemPrompt).toContain('NEVER map assistant attributes');
+    });
+
+    it('filters out diagnostic meta-commentary facts', async () => {
+      llm.respond(JSON.stringify([
+        {
+          category: 'context', factKey: 'search_status', factValue: 'search returned nothing',
+          confidence: 0.9, isCorrection: false, factType: 'permanent',
+        },
+        {
+          category: 'personal', factKey: 'hobbies', factValue: 'photography',
+          confidence: 1.0, isCorrection: false, factType: 'permanent',
+        },
+      ]));
+      pg.willReturn([]);
+      const out = await facts.extractFromMessages(
+        [{ role: 'user', content: 'I love photography.' }], 'user-1');
+      expect(out).toHaveLength(1);
+      expect(out[0].factKey).toBe('hobbies');
+      expect(out[0].factValue).toBe('photography');
+    });
+  });
+
+  describe('isMetaCommentaryFact', () => {
+    it('identifies search and retrieval failure commentary', () => {
+      expect(isMetaCommentaryFact('search_notes', 'search returned nothing')).toBe(true);
+      expect(isMetaCommentaryFact('memory_lookup', 'query found no results')).toBe(true);
+      expect(isMetaCommentaryFact('diagnostic', 'nothing came up during search')).toBe(true);
+      expect(isMetaCommentaryFact('birthday_query', 'no records found')).toBe(true);
+    });
+
+    it('passes through legitimate user facts', () => {
+      expect(isMetaCommentaryFact('name', 'Alice')).toBe(false);
+      expect(isMetaCommentaryFact('hobby', 'searching for antique books')).toBe(false);
+      expect(isMetaCommentaryFact('work_history', 'returned to previous company')).toBe(false);
     });
   });
 });

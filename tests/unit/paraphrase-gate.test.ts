@@ -132,6 +132,20 @@ describe('ParaphraseGate', () => {
     expect(v.path).toBe('gate_different_question');
   });
 
+  it('marks a situational directive against a standing policy as different_question', async () => {
+    const gate = new ParaphraseGate(
+      embeddings(same),
+      new FactMergeGate(
+        llm('{"compatible":false,"separation":"different_question","reason":"situational directive, not standing policy contradiction"}'),
+        mockLogger,
+      ),
+      mockLogger,
+    );
+    const v = await gate.isSemanticParaphrase('backup_policy', 'maintains daily automated backups', 'skip backup for today');
+    expect(v.paraphrase).toBe(false);
+    expect(v.path).toBe('gate_different_question');
+  });
+
   it('keeps a conflicting answer on the plain separate path', async () => {
     const gate = new ParaphraseGate(
       embeddings(same),

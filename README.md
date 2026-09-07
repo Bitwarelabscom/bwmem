@@ -21,11 +21,14 @@ v0.11.0 fixes this with four architectural pillars:
 
 On the 60-question LongMemEval_S benchmark evaluated on byte-identical retrieved context with the strict open-weights judge (`inclusionai/ling-3.0-flash`), Multi-Session accuracy doubled to **68.8%–75.0%**, lifting overall accuracy to **85.0% (51/60)** on `qwen/qwen3.8-max` (86.4% on completed answers) and **81.7%** on `glm-5.3` and `gemini-3.7-flash`.
 
-See [What's new in 0.11.0](#whats-new-in-0110), [0.10.0](#whats-new-in-0100), and [0.9.0](#whats-new-in-090).
+See [What's new in 0.11.1](#whats-new-in-0111), [0.11.0](#whats-new-in-0110), [0.10.0](#whats-new-in-0100), and [0.9.0](#whats-new-in-090).
 
 ## Features
 
 - **Bi-temporal facts** — facts track both *valid-time* (when something was true in the world) and *transaction-time* (when we believed it). Lets you answer "what did we believe on date Y about state on date X?" not just "what was true on date Y."
+- **Subject boundary enforcement** — guarantees extracted facts describe only the human user, preventing AI assistant persona or architecture details from polluting user memory (0.11.1)
+- **Anti-meta-commentary filtering** — prompt-level rules and programmatic validation (`isMetaCommentaryFact`) reject tool search failures and retrieval diagnostics before storage (0.11.1)
+- **Situational directive gating** — DeMem merge gate classifies temporary operational commands as `different_question` rather than false contradictions against standing policies (0.11.1)
 - **Intent-aware gather routing** — dynamic query classification between pinpoint retrieval (tight $k=25$, floor 0.5) and gather retrieval (wide $k=200$, floor 0.35) (0.11.0)
 - **Session diversification** — enforces balanced candidate quotas per session so evidence from across multi-conversation history reaches the reader without thread monopolization (0.11.0)
 - **Dialogue turn windowing** — lateral joins fetch immediate adjacent turns ($\pm 1$) around semantic hits, preserving conversational flow without full-session distractor noise (0.11.0)
@@ -224,6 +227,23 @@ await mem.textures.capture(session.id); // anchor for the next session
 
 await mem.shutdown();
 ```
+
+## What's new in 0.11.1
+
+### Extraction Integrity, Subject Boundary Enforcement & Situational Directives
+
+v0.11.1 strengthens the boundary between human user memory, conversational diagnostic commentary, and operational directives across real-time extraction, episodic consolidation, and semantic consolidation.
+
+#### 1. User vs. Assistant Subject Boundary
+In multi-turn chat interactions, conversational fact extractors can confuse dialogue participants, attributing AI assistant properties (system creation dates, model versions, bot persona details, or architecture notes) to user profile keys (such as user `age` or `birthday`). Extraction and consolidation prompts now enforce that the human user is the sole subject, preventing assistant characteristics from overwriting user facts or polluting long-term knowledge.
+
+#### 2. Anti-Meta-Commentary Filtering (`isMetaCommentaryFact`)
+Conversations containing retrieval feedback, tool execution logs, or search status messages (e.g. *"search returned nothing"*, *"query found no records"*) previously risked having diagnostic chatter recorded as durable user attributes. v0.11.1 introduces prompt-level anti-meta-commentary directives alongside `isMetaCommentaryFact()`, an algorithmic validation filter that drops diagnostic and retrieval-failure strings before persistence.
+
+#### 3. Situational Directives vs. Standing Policies
+The semantic merge gate (`FactMergeGate`) now explicitly distinguishes between one-off situational directives or operational exceptions (e.g., *"skip backup for today"*, *"pause sync for this session"*) and standing baseline policies (e.g., *"maintains daily automated backups"*). Situational commands answer what to do in an immediate context rather than defining a durable baseline trait, and are now classified as `different_question` rather than a contradiction (`conflicting_answer`).
+
+---
 
 ## What's new in 0.11.0
 

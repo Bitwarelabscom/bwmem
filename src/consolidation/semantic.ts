@@ -146,6 +146,7 @@ export class SemanticConsolidator {
         role: 'system',
         content: `Consolidate these recent conversation patterns into long-term semantic knowledge.
 Merge similar patterns, update existing knowledge, identify new insights.
+The human user is the subject: Consolidate knowledge about the user. Do NOT extract or consolidate facts about the AI assistant, bot persona, model architecture, or tool/search diagnostic observations into user knowledge.
 
 Existing knowledge:
 ${existingText}

@@ -73,13 +73,17 @@ const SYSTEM_PROMPT =
   'Only say compatible: true when the two are plainly the same claim reworded.\n' +
   'When compatible is false, also name WHICH kind of separation it is, in "separation":\n' +
   '  "different_question" — the new statement answers something other than the question the key ' +
-  'names, or merely comments on the fact instead of answering it. Nothing is being contradicted.\n' +
+  'names, or merely comments on the fact instead of answering it. Situational directives, one-off ' +
+  'operational commands, or temporary incident-specific exceptions (e.g. "pause sync for this session", ' +
+  '"skip backup for today") answer what to do in a specific situation, NOT the user\'s durable ' +
+  'baseline trait or standing policy; they are ALWAYS different_question. Nothing is being contradicted.\n' +
   '  "conflicting_answer" — both statements answer the question the key names, but the answers ' +
   'cannot both be true: different objects, times, scopes, polarity, quantities or conditions.\n' +
   'Worked examples: existing company_name / "Acme" vs "member of the dev team at Acme" -> ' +
-  '{"compatible": false, "separation": "different_question"}. Existing esp32_power / "balcony ' +
-  'ESP32 on battery" vs "balcony ESP32 on USB power" -> {"compatible": false, "separation": ' +
-  '"conflicting_answer"}.\n' +
+  '{"compatible": false, "separation": "different_question"}. Existing backup_policy / "maintains daily automated backups" ' +
+  'vs "skip backup for today" -> {"compatible": false, "separation": "different_question"}. ' +
+  'Existing esp32_power / "balcony ESP32 on battery" vs "balcony ESP32 on USB power" -> ' +
+  '{"compatible": false, "separation": "conflicting_answer"}.\n' +
   'If you cannot tell which, answer "conflicting_answer".\n' +
   'Reply with JSON only: {"compatible": true|false, "separation": "different_question"|' +
   '"conflicting_answer"|null, "reason": "<one short sentence>"}';

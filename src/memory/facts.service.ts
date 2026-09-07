@@ -58,6 +58,20 @@ export function isSpeakerFact(key: string): boolean {
   return SPEAKER_FACT_KEY_PATTERNS.some(p => p.test(key));
 }
 
+// Meta-commentary about system tools, search queries, or memory retrieval failures
+// must never be stored as durable facts (e.g., "search returned nothing", "could not find record").
+const META_COMMENTARY_PATTERNS = [
+  /\b(search(ed|ing)?|quer(y|ied)|retriev(al|ed)|lookup)\b.*\b(returned nothing|found nothing|no results?|nothing came up|empty|failed)\b/i,
+  /\b(returned nothing|found nothing|no results?|nothing came up)\b.*\b(search(ed|ing)?|quer(y|ied)|retriev(al|ed)|lookup)\b/i,
+  /\b(try searching|check(ed)? (the )?(database|logs|memory|index))\b/i,
+  /\bno records? found\b/i,
+];
+
+/** True if the key or value contains system retrieval/diagnostic commentary rather than user facts. */
+export function isMetaCommentaryFact(key: string, value: string): boolean {
+  return META_COMMENTARY_PATTERNS.some(p => p.test(key) || p.test(value));
+}
+
 // Present-tense session-moment state ("current_drink", "current_action", …).
 // Legitimate to note, but it must NEVER persist as a permanent, user-scoped
 // fact — it's stale the moment the session ends and pollutes every future
@@ -758,6 +772,8 @@ export class FactsService {
 Rules:
 - Extract EVERY fact the user states about themselves, their life, people, places, things, work, and feelings
 - Be thorough: extract 3-15 facts per message batch — miss nothing
+- The human user is the subject: NEVER extract facts about the AI assistant, system nature, model architecture, capabilities, or bot identity as user facts. NEVER overwrite a user fact (like user's "age" or "birthday") with assistant attributes (e.g., assistant model creation date or AI persona is NOT user age/birthday). If the conversation mentions someone else's or the assistant's age or creation date, do NOT assign it to the user's fact keys.
+- NEVER extract meta-commentary about system tools, search queries, or memory retrieval failures as facts (e.g., "search returned nothing", "could not find record", "no results found"). Commentary about search, tools, or retrieval is NOT a fact.
 - Use simple, normalized values (names, places, single concepts — not long phrases)
 - Use simple, normalized keys from this list where possible:
   name, location, employer, job_title, partner, child, pet_name, pet_type, interest, hobby, food, diet, allergy, dislike, field, university, goal, friend, sibling
@@ -792,10 +808,14 @@ Output a JSON array of AT MOST ${MAX_FACTS_PER_EXTRACTION} facts, most important
 Return [] if no facts found.`;
 
       if (existingFacts.length > 0) {
-        systemPrompt += `\n\nKnown facts:`;
+        systemPrompt += `\n\nKnown facts (context for corrections):`;
         for (const f of existingFacts) {
           systemPrompt += `\n- ${f.category}/${f.factKey}: ${f.factValue}`;
         }
+        systemPrompt += `\n\nHow to use known facts:
+- It is context to detect genuine updates/corrections, NOT material to re-extract.
+- If the conversation restates a known fact with the same meaning, SKIP it.
+- NEVER map assistant attributes (e.g., bot model age/creation date) onto user keys (e.g., user "age"). Only update a known fact if the user is explicitly correcting or updating their own personal attribute.`;
       }
 
       const response = await this.llm.chat([
@@ -870,6 +890,13 @@ Return [] if no facts found.`;
         }
         if (isSpeakerFact(f.factKey)) {
           this.logger.debug('Rejected speaker fact (structural, not memory)', { key: f.factKey });
+          return false;
+        }
+        if (isMetaCommentaryFact(f.factKey, f.factValue)) {
+          this.logger.debug('Rejected meta-commentary fact (diagnostic, not user memory)', {
+            key: f.factKey,
+            value: f.factValue,
+          });
           return false;
         }
         return true;

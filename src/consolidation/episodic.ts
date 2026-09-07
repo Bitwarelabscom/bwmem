@@ -54,15 +54,16 @@ export class EpisodicConsolidator {
       const response = await this.llm.chat([
         {
           role: 'system',
-          content: `Analyze this conversation and extract episodic patterns. Return JSON array:
+          content: `Analyze this conversation and extract episodic patterns. The human user is the subject. Return JSON array:
 [{"patternType": "theme|mood_shift|key_moment|preference_signal", "pattern": "description", "confidence": 0.0-1.0}]
 
 Pattern types:
 - theme: Main topics discussed
-- mood_shift: Significant emotional changes
-- key_moment: Important decisions, revelations, or turning points
+- mood_shift: Significant emotional changes of the user
+- key_moment: Important user decisions, revelations, or turning points
 - preference_signal: User preferences expressed or implied
 
+Do NOT extract patterns about the AI assistant's persona, system internals, or tool execution meta-commentary.
 Return [] if no significant patterns found.`,
         },
         { role: 'user', content: transcript.slice(0, 6000) },
