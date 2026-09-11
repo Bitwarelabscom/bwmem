@@ -10,23 +10,66 @@ Memory SDK for AI chatbots. Gives your bot persistent, per-user memory: bi-tempo
 
 Drop it into any chatbot — record messages, build context, inject into your LLM prompt. The SDK handles fact extraction, embeddings, sentiment analysis, response quality scoring, and long-term memory consolidation in the background.
 
-**v0.11.1 — subject boundary enforcement, anti-meta filtering, situational directive gating, and 85.0% LongMemEval multi-session synthesis.**
-Earlier releases hit a ceiling on multi-session aggregation: questions requiring synthesis across several distinct conversations suffered from session crowding (one verbose thread monopolizing candidate slots) and context fragmentation (single turns stripped of surrounding dialogue).
+## Related
 
-v0.11.0 resolved this with four architectural pillars:
-1. **Intent-Aware Gather Routing**: Compound aggregations and multi-session queries dynamically route to wide-recall passes ($k=200, \text{similarity floor}=0.35$), while pure temporal ordering preserves tight precision ($k=25, \text{floor}=0.5$).
-2. **Session Diversification**: Candidate quotas cap single-session dominance (default max 4–5 turns per session) so evidence from all relevant conversations reaches the prompt.
-3. **Lateral Dialogue Turn Windowing**: Surfaces immediate $\pm 1$ adjacent turns around semantic hits via lateral SQL joins, restoring conversational context without full-session distractor bloat.
-4. **Relevant Conversation Summaries**: Surfaces macro session abstracts from `bwmem_conversation_summaries` alongside granular turns, giving high-level intent alignment on preference queries.
+Extracted from [Luna](https://github.com/Bitwarelabscom/luna-v7.1), Bitware Labs’ long-running agent research system. Use bwmem when you want the memory layer as a standalone SDK.
 
-v0.11.1 strengthens memory extraction and gating integrity with:
-1. **Subject Boundary Enforcement**: Isolates human user memory from assistant persona, model capabilities, or architecture details.
-2. **Anti-Meta-Commentary Filtering**: Programmatic filter (`isMetaCommentaryFact`) and prompt guards dropping tool retrieval and search diagnostics before persistence.
-3. **Situational Directive Gating**: DeMem merge gate classifies temporary operational commands as `different_question`, preventing false contradictions against durable policies.
+## Requirements
 
-On the 60-question LongMemEval_S benchmark evaluated on byte-identical retrieved context with the strict open-weights judge (`inclusionai/ling-3.0-flash`), Multi-Session accuracy doubled to **68.8%–75.0%**, lifting overall accuracy to **85.0% (51/60)** on `qwen/qwen3.8-max` (86.4% on completed answers) and **81.7%** on `glm-5.3` and `gemini-3.7-flash`.
+- Node.js >= 18
+- PostgreSQL with [pgvector](https://github.com/pgvector/pgvector) extension
+- Redis
+- Neo4j (optional, for knowledge graph)
 
-See [What's new in 0.11.1](#whats-new-in-0111), [0.11.0](#whats-new-in-0110), [0.10.0](#whats-new-in-0100), and [0.9.0](#whats-new-in-090).
+## Install
+
+```bash
+npm install @bitwarelabs/bwmem
+```
+
+## Quick Start
+
+```typescript
+import { BwMem } from '@bitwarelabs/bwmem';
+import { OpenAIProvider } from '@bitwarelabs/bwmem/providers/openai';
+
+const provider = new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY! });
+
+const mem = new BwMem({
+  postgres: 'postgresql://localhost/myapp',
+  redis: 'redis://localhost:6379',
+  embeddings: provider,
+  llm: provider,
+});
+
+await mem.initialize();
+
+// Start a conversation
+const session = await mem.startSession({ userId: 'user-123' });
+
+// Record messages (fact extraction + embeddings run in background)
+await session.recordMessage({ role: 'user', content: 'I live in Tokyo and work at SakuraTech.' });
+await session.recordMessage({ role: 'assistant', content: 'Nice! What do you do there?' });
+await session.recordMessage({ role: 'user', content: 'I lead the ML perception team.' });
+
+// Build memory context for your LLM prompt
+const context = await mem.buildContext('user-123', { query: 'Tell me about yourself' });
+
+const response = await provider.chat([
+  { role: 'system', content: `You are helpful.\n\n${context.formatted}` },
+  { role: 'user', content: 'What do you know about me?' },
+]);
+
+// End session (triggers episodic consolidation + texture capture)
+await session.end();
+await mem.textures.capture(session.id); // anchor for the next session
+
+await mem.shutdown();
+```
+
+PRs welcome. Maintainer is async and low-bandwidth — expect slow replies, not silence forever.
+
+**Latest (0.11.2 / engine 0.11.1):** subject boundary enforcement, anti-meta filtering, situational directive gating, and **85.0%** LongMemEval multi-session synthesis. Full notes: [0.11.1](#whats-new-in-0111), [0.11.0](#whats-new-in-0110), [0.10.0](#whats-new-in-0100), [0.9.0](#whats-new-in-090).
 
 ## Features
 
@@ -179,59 +222,6 @@ consolidation staging. bwmem should land in the same range for that reason.
 its footnote. The adapter that does it drives only the public API, so what it
 measures is what `npm install @bitwarelabs/bwmem` gives you, defaults included.
 The remaining rows are still the parent stack's.
-
-## Requirements
-
-- Node.js >= 18
-- PostgreSQL with [pgvector](https://github.com/pgvector/pgvector) extension
-- Redis
-- Neo4j (optional, for knowledge graph)
-
-## Install
-
-```bash
-npm install @bitwarelabs/bwmem
-```
-
-## Quick Start
-
-```typescript
-import { BwMem } from '@bitwarelabs/bwmem';
-import { OpenAIProvider } from '@bitwarelabs/bwmem/providers/openai';
-
-const provider = new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY! });
-
-const mem = new BwMem({
-  postgres: 'postgresql://localhost/myapp',
-  redis: 'redis://localhost:6379',
-  embeddings: provider,
-  llm: provider,
-});
-
-await mem.initialize();
-
-// Start a conversation
-const session = await mem.startSession({ userId: 'user-123' });
-
-// Record messages (fact extraction + embeddings run in background)
-await session.recordMessage({ role: 'user', content: 'I live in Tokyo and work at SakuraTech.' });
-await session.recordMessage({ role: 'assistant', content: 'Nice! What do you do there?' });
-await session.recordMessage({ role: 'user', content: 'I lead the ML perception team.' });
-
-// Build memory context for your LLM prompt
-const context = await mem.buildContext('user-123', { query: 'Tell me about yourself' });
-
-const response = await provider.chat([
-  { role: 'system', content: `You are helpful.\n\n${context.formatted}` },
-  { role: 'user', content: 'What do you know about me?' },
-]);
-
-// End session (triggers episodic consolidation + texture capture)
-await session.end();
-await mem.textures.capture(session.id); // anchor for the next session
-
-await mem.shutdown();
-```
 
 ## What's new in 0.11.1
 
@@ -1513,4 +1503,6 @@ npm run start:api     # Start the REST API server
 
 ## License
 
-AGPL-3.0-only
+AGPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Commercial licensing is available for use that does not fit the AGPL’s terms — write to [henke@bitwarelabs.com](mailto:henke@bitwarelabs.com).
