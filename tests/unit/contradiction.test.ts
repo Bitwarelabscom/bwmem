@@ -319,6 +319,19 @@ describe('ContradictionService', () => {
       pg.willReturn([{ status: 'open', n: '2' }]);
       expect(await service.counts('user-1')).toEqual({ open: 2, held: 0, resolved: 0 });
     });
+
+    it('calculates oldestHeldDays for standing holds displacement age', async () => {
+      const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+      pg.willReturn([
+        { status: 'open', n: '1', oldest_held_at: null },
+        { status: 'held', n: '2', oldest_held_at: tenDaysAgo },
+        { status: 'resolved', n: '0', oldest_held_at: null },
+      ]);
+      const res = await service.counts('user-1');
+      expect(res.open).toBe(1);
+      expect(res.held).toBe(2);
+      expect(res.oldestHeldDays).toBe(10);
+    });
   });
 
   describe('formatForPrompt', () => {

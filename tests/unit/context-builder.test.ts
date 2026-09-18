@@ -276,5 +276,39 @@ describe('ContextBuilder', () => {
       expect(ctx.formatted).toContain('User discussed collecting rare items and books');
       expect(ctx.formatted).toContain('(Topics: rare items, books)');
     });
+
+    it('prepends in-band curator ring when curation is enabled', async () => {
+      const mockCurator: any = {
+        curateMemory: async () => ({
+          skipped: false,
+          facts: [],
+          similarMessages: [],
+          similarConversations: [],
+          curatorRing: '[Curator: 5 evaluated, 2 kept, 3 dropped]',
+        }),
+      };
+
+      const curatedBuilder = new ContextBuilder(
+        pg as never,
+        builder['facts'],
+        builder['embedding'],
+        builder['emotionalMoments'],
+        builder['contradictions'],
+        builder['behavioral'],
+        builder['sessionTexture'],
+        builder['selfIntention'],
+        null,
+        null,
+        'bwmem_',
+        mockLogger,
+        mockCurator,
+      );
+
+      for (let i = 0; i < 10; i++) pg.willReturn([]);
+
+      const ctx = await curatedBuilder.build('user-1', { query: 'test topic', curate: true });
+      expect(ctx.curatorRing).toBe('[Curator: 5 evaluated, 2 kept, 3 dropped]');
+      expect(ctx.formatted.startsWith('[Curator: 5 evaluated, 2 kept, 3 dropped]')).toBe(true);
+    });
   });
 });

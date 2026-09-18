@@ -21,6 +21,71 @@ export interface LLMOptions {
   json?: boolean;
 }
 
+// ---- Decision Provider Interfaces (System One / Jev) ----
+
+export interface NoulQuestion {
+  type: 'noul';
+  instructions: string | Record<string, unknown> | unknown[];
+  criteria?: {
+    true?: string;
+    false?: string;
+  };
+}
+
+export interface ChoiceQuestion {
+  type: 'choice';
+  instructions: string | Record<string, unknown> | unknown[];
+  criteria: Record<string, string | null>;
+}
+
+export interface ScoreQuestion {
+  type: 'score';
+  instructions: string | Record<string, unknown> | unknown[];
+  criteria: string[];
+}
+
+export type DecisionQuestion = NoulQuestion | ChoiceQuestion | ScoreQuestion;
+
+export interface NoulAnswer {
+  type?: 'noul';
+  noul: number;
+}
+
+export interface ChoiceAnswer {
+  type?: 'choice';
+  choice: string;
+  probabilities?: Record<string, number>;
+  confidence?: number;
+}
+
+export interface ScoreAnswer {
+  type?: 'score';
+  score: number;
+  probabilities?: Record<string, number>;
+  confidence?: number;
+}
+
+export type DecisionAnswer = NoulAnswer | ChoiceAnswer | ScoreAnswer;
+
+export interface DecisionRequest {
+  state: string | Record<string, unknown> | unknown[];
+  questions: Record<string, DecisionQuestion>;
+  model?: string;
+}
+
+export interface DecisionResponse {
+  model?: string;
+  answers: Record<string, DecisionAnswer>;
+  usage?: {
+    input_tokens: number;
+    output_tokens: number;
+  };
+}
+
+export interface DecisionProvider {
+  decide(request: DecisionRequest, options?: { timeoutMs?: number }): Promise<DecisionResponse>;
+}
+
 // ---- Config ----
 
 export interface BwMemConfig {
@@ -28,6 +93,12 @@ export interface BwMemConfig {
   redis: string | RedisConfig;
   embeddings: EmbeddingProvider;
   llm: LLMProvider;
+  /**
+   * Fast System One decision provider (TypeSafe AI / Jev or OpenRouter decisions API).
+   * Used for ~250ms fact merge gating and parallel memory curation.
+   * If omitted but `llm` implements `decide` (e.g. OpenRouterProvider), it will be used automatically.
+   */
+  decision?: DecisionProvider;
   graph?: GraphPlugin;
   consolidation?: ConsolidationConfig;
   session?: SessionOptions;
@@ -455,13 +526,29 @@ export interface MemoryContext {
   timeline?: string;
   /** Which retrieval profile the query selected, and why. Absent if overridden or disabled. */
   retrievalProfile?: import('./memory/retrieval-profile.js').RetrievalProfile;
+  /** In-band curator ring seen at token 0, e.g. [Curator: N evaluated, K kept, D dropped]. */
+  curatorRing?: string;
   formatted: string;
   sourcesResponded: string;
+}
+
+export interface ContradictionCounts {
+  open: number;
+  held: number;
+  resolved: number;
+  /** Days since the oldest standing held contradiction was held (displacement age). */
+  oldestHeldDays?: number;
 }
 
 export interface BuildContextOptions {
   query?: string;
   sessionId?: string;
+  /**
+   * Run pre-reply curation (TypeSafe System One / Jev or LLM) to prune low-relevance
+   * candidates before prompt injection, inserting the in-band curator ring.
+   * Dropped candidates are recorded into the Curator Rejection Ledger for topic inquiry.
+   */
+  curate?: boolean;
   maxFacts?: number;
   /**
    * Recall depth for message search. Default **25**.

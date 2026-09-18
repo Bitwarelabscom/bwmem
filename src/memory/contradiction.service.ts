@@ -1,7 +1,7 @@
 import type { PgClient } from '../db/postgres.js';
 import type {
   Logger, ContradictionSignal, ContradictionDecision, ContradictionStatus,
-  InlineContradiction, Fact,
+  InlineContradiction, Fact, ContradictionCounts,
 } from '../types.js';
 import { getConceptTokens, getSemantics } from './fact-semantics.js';
 import { isVolatileFactKey } from './facts.service.js';
@@ -401,23 +401,33 @@ export class ContradictionService {
   }
 
   /**
-   * Lifecycle counts for a user. `resolved` is now a number that can be
-   * non-zero — before 017 there was no code path that could produce one.
+   * Lifecycle counts for a user, including passive standing holds displacement age (oldestHeldDays).
+   * `resolved` is now a number that can be non-zero — before 017 there was no code path that could produce one.
    */
-  async counts(userId: string): Promise<{ open: number; held: number; resolved: number }> {
+  async counts(userId: string): Promise<ContradictionCounts> {
     try {
-      const rows = await this.pg.query<{ status: string; n: string }>(
-        `SELECT status, COUNT(*) AS n
+      const rows = await this.pg.query<{ status: string; n: string; oldest_held_at: Date | null }>(
+        `SELECT status, COUNT(*) AS n, MIN(held_at) AS oldest_held_at
            FROM ${this.prefix}contradiction_signals
           WHERE user_id = $1
           GROUP BY status`,
         [userId],
       );
-      const out = { open: 0, held: 0, resolved: 0 };
+      const out: ContradictionCounts = { open: 0, held: 0, resolved: 0 };
+      let minHeldTime: number | null = null;
       for (const r of rows) {
         if (r.status === 'open' || r.status === 'held' || r.status === 'resolved') {
           out[r.status] = Number(r.n);
         }
+        if (r.status === 'held' && r.oldest_held_at) {
+          const t = new Date(r.oldest_held_at).getTime();
+          if (!isNaN(t) && (minHeldTime === null || t < minHeldTime)) {
+            minHeldTime = t;
+          }
+        }
+      }
+      if (minHeldTime !== null) {
+        out.oldestHeldDays = Math.max(0, Math.floor((Date.now() - minHeldTime) / (1000 * 60 * 60 * 24)));
       }
       return out;
     } catch (error) {

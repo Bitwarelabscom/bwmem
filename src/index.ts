@@ -17,6 +17,17 @@ export type {
   LLMProvider,
   ChatMessage,
   LLMOptions,
+  DecisionProvider,
+  DecisionRequest,
+  DecisionResponse,
+  DecisionQuestion,
+  DecisionAnswer,
+  NoulQuestion,
+  ChoiceQuestion,
+  ScoreQuestion,
+  NoulAnswer,
+  ChoiceAnswer,
+  ScoreAnswer,
 
   // Graph plugin interface
   GraphPlugin,
@@ -43,6 +54,7 @@ export type {
   ContradictionSignal,
   ContradictionDecision,
   ContradictionStatus,
+  ContradictionCounts,
   InlineContradiction,
   BehavioralObservation,
   SentimentResult,
@@ -134,3 +146,21 @@ export type {
   ExclusiveFamily, CategoryCollision, CollisionFact, ActiveFactRow,
   StoredCollision, DecisionResidue, SettleResult,
 } from './memory/fact-collision.service.js';
+
+// Pre-reply curation & Rejection Ledger (0.12.0)
+export { CuratorRejectionService } from './memory/curator-rejection.service.js';
+export type { DroppedMemoryItem } from './memory/curator-rejection.service.js';
+export {
+  MemoryCurationService, scoreMessageComplexity,
+} from './memory/memory-curation.service.js';
+export type {
+  ComplexityScore, MemoryCandidates, CurationResult,
+} from './memory/memory-curation.service.js';
+export { reviewDroppedMemoriesTool } from './bwmem.js';
+
+// Providers (0.12.0)
+export { TypeSafeProvider } from './providers/typesafe.js';
+export type { TypeSafeProviderConfig } from './providers/typesafe.js';
+export { OpenRouterProvider } from './providers/openrouter.js';
+export { OpenAIProvider } from './providers/openai.js';
+export { OllamaProvider } from './providers/ollama.js';

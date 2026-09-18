@@ -69,9 +69,22 @@ await mem.shutdown();
 
 PRs welcome. Maintainer is async and low-bandwidth — expect slow replies, not silence forever.
 
-**Latest (0.11.2 / engine 0.11.1):** subject boundary enforcement, anti-meta filtering, situational directive gating, and **85.0%** LongMemEval multi-session synthesis. Full notes: [0.11.1](#whats-new-in-0111), [0.11.0](#whats-new-in-0110), [0.10.0](#whats-new-in-0100), [0.9.0](#whats-new-in-090).
+**v0.12.0 — TypeSafe AI (Jev) System One decision models, ~250ms merge gating, curator rejection ledger & in-band count ring, and standing holds displacement age.**
+TypeSafe AI decision models are now integrated directly into `bwmem`, available both natively and via OpenRouter (`~typesafe/jev-latest` at `https://openrouter.ai/api/alpha/decisions`). System One decision models evaluate structured primitives (`noul`, `choice`, `score`) with calibrated probabilities in 70–500ms without autoregressive text generation:
+1. **Autonomous Fact Merge Gate Fast Path**: DeMem Theorem 1 decision compatibility evaluated in ~250ms flat (replacing multi-second generative LLM calls).
+2. **Pre-Reply Memory Curation**: Parallel candidate evaluation via calibrated `noul` decisions with capacity bounds and an honest in-band token-0 count ring (`[Curator: N evaluated, K kept, D dropped]`).
+3. **Curator Rejection Ledger**: Session-persistent buffer (TTL 7d) capturing pruned candidates with probability metadata (`[p=0.12]`), queryable by topic/keyword regardless of score via `review_dropped_memories`.
+4. **Standing Holds Passive Displacement Ring**: Tracks `oldestHeldDays` computed from `min(held_at)` in contradiction signal counts.
+
+See [What's new in 0.12.0](#whats-new-in-0120), [0.11.1](#whats-new-in-0111), [0.11.0](#whats-new-in-0110), and [0.10.0](#whats-new-in-0100).
 
 ## Features
+
+- **TypeSafe AI (Jev) decision models** — System One structured decisions (`noul`, `choice`, `score`) in 70–500ms via OpenRouter (`~typesafe/jev-latest`) or native TypeSafe API (0.12.0)
+- **Fast fact merge gating** — ~250ms decision compatibility check via choice questions, preventing 7% timeout hangs on generative LLM merge checks (0.12.0)
+- **Pre-reply memory curation** — parallel relevance evaluation with honest in-band token-0 count ring (`[Curator: N evaluated, K kept, D dropped]`) and no synthetic hero-fact disguises (0.12.0)
+- **Curator rejection ledger** — session-persistent buffer (TTL 7d) recording pruned candidates with probability metadata, inspectable by topic/keyword via `review_dropped_memories` (0.12.0)
+- **Standing holds displacement age** — tracks `oldestHeldDays` on held contradictions from `min(held_at)` without premature age alarms (0.12.0)
 
 - **Bi-temporal facts** — facts track both *valid-time* (when something was true in the world) and *transaction-time* (when we believed it). Lets you answer "what did we believe on date Y about state on date X?" not just "what was true on date Y."
 - **Subject boundary enforcement** — guarantees extracted facts describe only the human user, preventing AI assistant persona or architecture details from polluting user memory (0.11.1)
@@ -223,6 +236,74 @@ its footnote. The adapter that does it drives only the public API, so what it
 measures is what `npm install @bitwarelabs/bwmem` gives you, defaults included.
 The remaining rows are still the parent stack's.
 
+## What's new in 0.12.0
+
+### TypeSafe AI (Jev) System One Decision Models, ~250ms Merge Gating, Curator Rejection Ledger, and Standing Holds Ring
+
+v0.12.0 introduces support for TypeSafe AI System One decision models (Jev) — both natively and via OpenRouter's decisions endpoint (`~typesafe/jev-latest` at `https://openrouter.ai/api/alpha/decisions`). System One decision models evaluate structured primitives (`noul`, `choice`, `score`) with calibrated probabilities in 70–500ms without autoregressive text generation, eliminating the multi-second latency and timeout hangs of generative LLM gating.
+
+#### 1. Fast Decision-Compatibility Fact Merge Gate (~250ms)
+DeMem Theorem 1 (arXiv 2605.10870) proves that semantic fact deduplication must gate on *decision compatibility*, not descriptive cosine similarity. Previously, evaluating merge compatibility required a full generative LLM call taking 2.9s–6.7s, with 7% of calls timing out.
+In v0.12.0, when a `DecisionProvider` is configured (or when using `OpenRouterProvider`), `FactMergeGate` uses a calibrated `choice` question:
+- `compatible_merge` — safe to merge into one fact slot (same claim reworded).
+- `conflicting_answer` — genuine value swap or conflicting claim.
+- `different_question` — answers a different question (e.g. job role vs company name) or represents a situational directive.
+
+Decisions complete in ~250ms with zero generation token cost, falling back gracefully to standard chat completions if the decision provider is unavailable.
+
+#### 2. Pre-Reply Memory Curation & In-Band Token-0 Curator Ring
+Before prompt injection, `MemoryCurationService` evaluates candidate memories (facts, past messages, conversation summaries) in parallel using calibrated `noul` questions.
+- **In-Band Quiet Count Ring**: The curator prepends an honest status ring seen at token 0 as context is injected:
+  - `[Curator: N evaluated, K kept, D dropped]`
+  - `[Curator: N evaluated, 0 kept, D dropped — all candidates scored below relevance threshold]`
+  - `[Curator: 0 evaluated — storage returned no candidate memories]`
+- **No Synthetic Hero-Fact Disguises**: Thin prompt states remain genuinely empty rather than injecting arbitrary facts, giving the downstream model honest awareness of its own memory boundaries.
+
+#### 3. Curator Rejection Ledger & Topic-Based Inspection
+Dropped candidate memories are persisted to a session-persistent Redis buffer (with in-memory fallback, TTL 7 days, 200-item cap).
+- **Topic/Query Inspection**: Unlike relevance gating, inspection is topic-driven (`bwmem.curation.getDropped(sessionId, query)`) regardless of score. The model's calibrated probability score is reported as metadata (`[p=0.12]`), not as a filter.
+- **Function Calling Tool**: Ships with `reviewDroppedMemoriesTool` (`review_dropped_memories`) so autonomous companions and agents can inspect what the curator dropped when a prompt feels surprisingly bare on a topic.
+
+#### 4. Standing Holds Passive Displacement Ring
+Contradictions placed on `held` status now record `oldestHeldDays` (computed from `min(held_at)`), providing passive displacement age visibility in `contradictions.counts()` without false alarms.
+
+#### 5. OpenRouter ~typesafe/jev-latest & Native TypeSafe Provider
+- **OpenRouterProvider**: Implements `DecisionProvider` out of the box, defaulting to OpenRouter's `https://openrouter.ai/api/alpha/decisions` with model `~typesafe/jev-latest`. Output tokens are free; input tokens are priced at $0.042/M.
+- **TypeSafeProvider**: Direct connection to `https://api.typesafe.ai/v1/systemone` using native API keys.
+
+```typescript
+import { BwMem, OpenRouterProvider, TypeSafeProvider } from '@bitwarelabs/bwmem';
+
+// Option A: OpenRouter with ~typesafe/jev-latest (unified provider)
+const openrouter = new OpenRouterProvider({
+  apiKey: process.env.OPENROUTER_API_KEY!,
+  model: 'anthropic/claude-3.5-haiku',
+  decisionModel: '~typesafe/jev-latest',
+});
+
+const mem = new BwMem({
+  postgres: process.env.DATABASE_URL!,
+  redis: process.env.REDIS_URL!,
+  embeddings: openrouter,
+  llm: openrouter, // OpenRouterProvider automatically provides DecisionProvider
+});
+
+// Option B: Dedicated TypeSafe System One provider
+const typesafe = new TypeSafeProvider({
+  apiKey: process.env.TYPESAFE_API_KEY!,
+  model: 'jev-latest',
+});
+
+const memWithCustomDecision = new BwMem({
+  postgres: process.env.DATABASE_URL!,
+  redis: process.env.REDIS_URL!,
+  embeddings: openrouter,
+  llm: openrouter,
+  decision: typesafe,
+});
+```
+
+---
 ## What's new in 0.11.1
 
 ### Extraction Integrity, Subject Boundary Enforcement & Situational Directives

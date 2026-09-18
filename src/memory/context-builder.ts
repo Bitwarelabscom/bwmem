@@ -7,6 +7,7 @@ import type { BehavioralService } from './behavioral.service.js';
 import type { SessionTextureService } from './session-texture.service.js';
 import type { SelfIntentionService } from './self-intention.service.js';
 import type { TemporalEventsService } from './temporal-events.service.js';
+import type { MemoryCurationService } from './memory-curation.service.js';
 import type { GraphPlugin, Logger, MemoryContext, BuildContextOptions, EpisodicPattern, SemanticEntry } from '../types.js';
 import { safeQuery } from '../utils/safe-query.js';
 import { classifyRetrieval } from './retrieval-profile.js';
@@ -48,6 +49,7 @@ export class ContextBuilder {
   private graph: GraphPlugin | null;
   private prefix: string;
   private logger: Logger;
+  private curator: MemoryCurationService | null;
 
   constructor(
     pg: PgClient,
@@ -62,6 +64,7 @@ export class ContextBuilder {
     graph: GraphPlugin | null,
     prefix: string,
     logger: Logger,
+    curator: MemoryCurationService | null = null,
   ) {
     this.pg = pg;
     this.facts = facts;
@@ -75,6 +78,7 @@ export class ContextBuilder {
     this.graph = graph;
     this.prefix = prefix;
     this.logger = logger;
+    this.curator = curator;
   }
 
   /** Build memory context for LLM prompt injection. */
@@ -177,18 +181,43 @@ export class ContextBuilder {
     const responded = results.filter(r => r.status === 'fulfilled' && r.value.ok).length;
     const total = results.length;
 
+    let finalFacts = factsResult;
+    let finalMsgs = similarMessages;
+    let finalConvs = similarConversations;
+    let curatorRing: string | undefined;
+
+    if (options?.curate && this.curator && query) {
+      const curated = await this.curator.curateMemory({
+        message: query,
+        candidates: {
+          facts: factsResult,
+          similarMessages,
+          similarConversations,
+        },
+        sessionId,
+      });
+
+      if (!curated.skipped) {
+        finalFacts = curated.facts;
+        finalMsgs = curated.similarMessages;
+        finalConvs = curated.similarConversations;
+        curatorRing = curated.curatorRing;
+      }
+    }
+
     const formatted = this.format(
-      factsResult, similarMessages, similarConversations, emotionalMoments, contradictionsList,
+      finalFacts, finalMsgs, finalConvs, emotionalMoments, contradictionsList,
       behavioralObs, episodicPatterns, semanticKnowledge, graphContext,
       textureBlock, intentionBlock, timelineBlock,
       options?.clipRecalledChars ?? DEFAULT_CLIP_CHARS,
       options?.chronologicalRecall !== false,
+      curatorRing,
     );
 
     return {
-      facts: factsResult,
-      similarMessages,
-      similarConversations,
+      facts: finalFacts,
+      similarMessages: finalMsgs,
+      similarConversations: finalConvs,
       emotionalMoments,
       contradictions: contradictionsList,
       behavioralObservations: behavioralObs,
@@ -199,6 +228,7 @@ export class ContextBuilder {
       intentionPrompt: intentionBlock || undefined,
       timeline: timelineBlock || undefined,
       retrievalProfile: profile ?? undefined,
+      curatorRing,
       formatted,
       sourcesResponded: `${responded}/${total}`,
     };
@@ -324,8 +354,12 @@ export class ContextBuilder {
     timeline: string,
     clipChars: number,
     chronological: boolean,
+    curatorRing?: string,
   ): string {
     const sections: string[] = [];
+
+    // In-band curator ring leads (Luna spec: seen at token 0 as context is injected)
+    if (curatorRing) sections.push(curatorRing);
 
     // Texture leads (carries the felt momentum from the last session).
     if (sessionTexture) sections.push(sessionTexture);

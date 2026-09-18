@@ -56,7 +56,26 @@ describe('OpenRouterProvider', () => {
       model: 'openai/gpt-4o',
       embeddingModel: 'openai/text-embedding-3-large',
       embeddingDimensions: 3072,
+      decisionModel: '~typesafe/jev-latest',
     });
     expect(provider.dimensions).toBe(3072);
+  });
+
+  it('implements DecisionProvider interface', () => {
+    const provider = new OpenRouterProvider({ apiKey: 'or-test' });
+    expect(typeof provider.decide).toBe('function');
+  });
+});
+
+describe('TypeSafeProvider', () => {
+  it('creates with API key', async () => {
+    const { TypeSafeProvider } = await import('../../src/providers/typesafe.js');
+    const provider = new TypeSafeProvider({ apiKey: 'ts-test' });
+    expect(typeof provider.decide).toBe('function');
+  });
+
+  it('throws without API key', async () => {
+    const { TypeSafeProvider } = await import('../../src/providers/typesafe.js');
+    expect(() => new TypeSafeProvider({ apiKey: '' })).toThrow('requires apiKey');
   });
 });

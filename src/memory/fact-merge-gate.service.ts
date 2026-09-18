@@ -16,7 +16,7 @@
  * is not proof of compatibility, but this is a noise filter on a noise filter and
  * it must never make the write path flakier than it was without it.
  */
-import type { LLMProvider, Logger } from '../types.js';
+import type { LLMProvider, DecisionProvider, Logger } from '../types.js';
 
 /**
  * A cold provider call was measured at 3-5s, and over 128 live gate calls: avg
@@ -118,6 +118,7 @@ export class FactMergeGate {
     private llm: LLMProvider,
     private logger: Logger,
     private timeoutMs: number = DEFAULT_TIMEOUT_MS,
+    private decisionProvider?: DecisionProvider,
   ) {}
 
   /** Same one-sided logic as {@link check}, but reports how the call ended. */
@@ -125,6 +126,72 @@ export class FactMergeGate {
     existing: { key: string; value: string },
     candidate: { key: string; value: string },
   ): Promise<MergeGateResult> {
+    // Fast path: TypeSafe System One decision model (~250ms vs ~3,000-7,000ms for LLMs)
+    if (this.decisionProvider) {
+      try {
+        const state = `Existing fact (${existing.key}): ${existing.value}\nNew statement (${candidate.key}): ${candidate.value}`;
+        const resp = await this.decisionProvider.decide(
+          {
+            state,
+            questions: {
+              verdict: {
+                type: 'choice',
+                instructions: 'How should the memory system handle this new statement relative to the existing fact?',
+                criteria: {
+                  compatible_merge: 'The new statement answers the same question with equivalent meaning; can safely merge into one fact.',
+                  conflicting_answer: 'The new statement answers the same question but contradicts or updates the value (e.g. different times, polarity, quantities, or conditions).',
+                  different_question: 'The new statement answers a DIFFERENT question (e.g. user job role vs company name, operational command) and must be kept in its own separate fact slot.',
+                },
+              },
+            },
+          },
+          { timeoutMs: Math.min(this.timeoutMs, 3000) },
+        );
+
+        const answer = resp?.answers?.verdict;
+        if (answer && 'choice' in answer && typeof answer.choice === 'string') {
+          const choice = answer.choice;
+          const probs = answer.probabilities || {};
+          const prob = ((probs[choice] ?? answer.confidence ?? 1) * 100).toFixed(0);
+
+          if (choice === 'compatible_merge') {
+            return {
+              verdict: {
+                compatible: true,
+                reason: `TypeSafe decision model verified decision compatibility (${prob}%)`,
+                separation: null,
+              },
+              outcome: 'ok',
+            };
+          }
+          if (choice === 'conflicting_answer') {
+            return {
+              verdict: {
+                compatible: false,
+                reason: `TypeSafe decision model identified conflicting value (${prob}%)`,
+                separation: 'conflicting_answer',
+              },
+              outcome: 'ok',
+            };
+          }
+          if (choice === 'different_question') {
+            return {
+              verdict: {
+                compatible: false,
+                reason: `TypeSafe decision model identified different question scope (${prob}%)`,
+                separation: 'different_question',
+              },
+              outcome: 'ok',
+            };
+          }
+        }
+      } catch (err) {
+        this.logger.debug('Decision provider evaluation failed, falling back to LLM', {
+          error: (err as Error).message,
+        });
+      }
+    }
+
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const completion = this.llm.chat(

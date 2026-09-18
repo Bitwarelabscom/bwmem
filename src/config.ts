@@ -18,6 +18,7 @@ export interface ResolvedConfig {
   redis: string | import('./types.js').RedisConfig;
   embeddings: BwMemConfig['embeddings'];
   llm: BwMemConfig['llm'];
+  decision?: BwMemConfig['decision'];
   graph?: BwMemConfig['graph'];
   tablePrefix: string;
   consolidation: {
@@ -66,12 +67,22 @@ export function resolveConfig(input: BwMemConfig): ResolvedConfig {
   if (!input.llm || typeof input.llm.chat !== 'function') {
     throw new Error('bwmem: config.llm must implement LLMProvider (chat)');
   }
+  if (input.decision && typeof input.decision.decide !== 'function') {
+    throw new Error('bwmem: config.decision must implement DecisionProvider (decide)');
+  }
+
+  const decision = input.decision ?? (
+    typeof (input.llm as { decide?: unknown })?.decide === 'function'
+      ? (input.llm as unknown as import('./types.js').DecisionProvider)
+      : undefined
+  );
 
   return {
     postgres: input.postgres,
     redis: input.redis,
     embeddings: input.embeddings,
     llm: input.llm,
+    decision,
     graph: input.graph,
     tablePrefix: input.tablePrefix ?? DEFAULT_TABLE_PREFIX,
     consolidation: {

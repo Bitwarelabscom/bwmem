@@ -39,6 +39,8 @@ import { ContextBuilder } from './memory/context-builder.js';
 import { QualityScorerService, type ScoreResponseInput, type ResolveFollowupInput } from './memory/quality-scorer.service.js';
 import { SessionTextureService } from './memory/session-texture.service.js';
 import { SelfIntentionService, type IntentionPromptOptions } from './memory/self-intention.service.js';
+import { CuratorRejectionService, type DroppedMemoryItem } from './memory/curator-rejection.service.js';
+import { MemoryCurationService } from './memory/memory-curation.service.js';
 import { SessionManager } from './session/session-manager.js';
 import { ConsolidationScheduler } from './consolidation/scheduler.js';
 import type { Session } from './session/session.js';
@@ -60,6 +62,8 @@ interface Services {
   qualityScorer: QualityScorerService;
   sessionTexture: SessionTextureService;
   selfIntention: SelfIntentionService;
+  curatorRejection: CuratorRejectionService;
+  curator: MemoryCurationService;
   contextBuilder: ContextBuilder;
   sessionManager: SessionManager;
   scheduler: ConsolidationScheduler | null;
@@ -101,9 +105,8 @@ export class BwMem {
     const centroid = new CentroidService(redis, logger);
     // The DeMem gate is shared: one definition of "same claim" must govern both
     // the key axis (fact-key merge) and the value axis (contradiction signals).
-    // Two independent notions of sameness disagree, and the disagreement shows
-    // up as facts that merge but still file a contradiction against themselves.
-    const mergeGate = new FactMergeGate(this.config.llm, logger);
+    // When a decision provider is configured, fast System One (~250ms) is used.
+    const mergeGate = new FactMergeGate(this.config.llm, logger, undefined, this.config.decision);
     const keyMerge = new FactKeyMerge(
       pg, prefix, this.config.embeddings, mergeGate, logger,
       this.config.factKeyMerge,
@@ -130,12 +133,15 @@ export class BwMem {
     const qualityScorer = new QualityScorerService(pg, this.config.llm, this.config.embeddings, prefix, logger);
     const sessionTexture = new SessionTextureService(pg, this.config.llm, prefix, logger);
     const selfIntention = new SelfIntentionService(pg, prefix, logger);
+    const curatorRejection = new CuratorRejectionService(redis, prefix, logger);
+    const curator = new MemoryCurationService(this.config.llm, this.config.decision, curatorRejection, logger);
 
     const contextBuilder = new ContextBuilder(
       pg, facts, embedding, emotionalMoments,
       contradictions, behavioral, sessionTexture, selfIntention,
       temporalEvents,
       this.config.graph ?? null, prefix, logger,
+      curator,
     );
 
     const sessionManager = new SessionManager(
@@ -160,6 +166,7 @@ export class BwMem {
       emotionalMoments, contradictions, behavioral, summaries, temporalEvents,
       factCollisions,
       qualityScorer, sessionTexture, selfIntention,
+      curatorRejection, curator,
       contextBuilder, sessionManager, scheduler,
     };
 
@@ -313,6 +320,19 @@ export class BwMem {
     };
   }
 
+  /** Pre-reply memory curation and dropped candidate ledger API. */
+  get curation(): CurationAPI {
+    const s = this.ensureReady();
+    return {
+      getDropped: (sessionId, query, limit) => s.curatorRejection.getDroppedMemories(sessionId, query, limit),
+      formatDropped: (items, query) => s.curatorRejection.formatDroppedMemoriesForResponse(items, query),
+      reviewDropped: async (sessionId, query, limit) => {
+        const items = await s.curatorRejection.getDroppedMemories(sessionId, query, limit);
+        return s.curatorRejection.formatDroppedMemoriesForResponse(items, query);
+      },
+    };
+  }
+
   /** Trigger a consolidation run on demand. */
   async triggerConsolidation(type: 'daily' | 'weekly'): Promise<void> {
     const s = this.ensureReady();
@@ -435,8 +455,17 @@ interface ContradictionsAPI {
   ): Promise<boolean>;
   /** Set one aside without deciding. Lapses when the underlying fact moves. */
   hold(userId: string, id: string, reason?: string): Promise<boolean>;
-  counts(userId: string): Promise<{ open: number; held: number; resolved: number }>;
+  counts(userId: string): Promise<import('./types.js').ContradictionCounts>;
   detectInline(message: string, facts: Fact[]): import('./types.js').InlineContradiction[];
+}
+
+interface CurationAPI {
+  /** Inspect candidate memories dropped by the pre-reply curator in this session. */
+  getDropped(sessionId: string, query?: string, limit?: number): Promise<DroppedMemoryItem[]>;
+  /** Format dropped candidate memories for prompt or tool display. */
+  formatDropped(items: DroppedMemoryItem[], query?: string): string;
+  /** Direct query and formatting of dropped candidate memories for this session. */
+  reviewDropped(sessionId: string, query?: string, limit?: number): Promise<string>;
 }
 
 interface BehavioralAPI {
@@ -467,3 +496,31 @@ interface IntentionsAPI {
   listAll(userId: string, limit?: number): Promise<SelfIntention[]>;
   getPrompt(userId: string, opts?: IntentionPromptOptions): Promise<string>;
 }
+
+/**
+ * Tool schema for LLM function calling to inspect dropped candidate memories.
+ */
+export const reviewDroppedMemoriesTool = {
+  type: 'function' as const,
+  function: {
+    name: 'review_dropped_memories',
+    description:
+      'Inspect candidate memories that the pre-reply curator evaluated and dropped during this session. ' +
+      'Use when a prompt feels strangely bare on a topic or when the user references something suspected to be pruned. ' +
+      'Searches session history by topic or keyword (score is shown as metadata, not as a filter).',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Topic or keyword to search for across dropped candidate facts, messages, and conversations. If omitted, lists the most recent dropped items.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of dropped items to return (default 15).',
+        },
+      },
+      required: [],
+    },
+  },
+};

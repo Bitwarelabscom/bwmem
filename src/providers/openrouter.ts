@@ -1,4 +1,12 @@
-import type { EmbeddingProvider, LLMProvider, ChatMessage, LLMOptions } from '../types.js';
+import type {
+  EmbeddingProvider,
+  LLMProvider,
+  DecisionProvider,
+  DecisionRequest,
+  DecisionResponse,
+  ChatMessage,
+  LLMOptions,
+} from '../types.js';
 import { assertComplete } from './completion.js';
 
 interface OpenRouterProviderConfig {
@@ -9,34 +17,36 @@ interface OpenRouterProviderConfig {
   /**
    * Let the model emit reasoning tokens. Default false, and the default is the
    * important part.
-   *
-   * OpenRouter fronts a lot of reasoning-first models — most of the free tier is
-   * reasoning-first — and reasoning tokens are billed and emitted BEFORE any
-   * content while counting against the same `max_tokens`. Every internal caller
-   * in this package asks for a small, deliberate budget (30 tokens for an
-   * emotion label, 120 for a merge gate, 200 for a quality score). With
-   * reasoning on, that budget is consumed thinking and the caller gets an empty
-   * string with `finish_reason: 'length'`.
-   *
-   * None of this package's prompts benefit from reasoning: they are extraction
-   * and classification with a fixed output shape. So it is off unless you ask.
    */
   reasoning?: boolean;
+  /**
+   * System One decision model for fast structured routing/classification.
+   * Default: '~typesafe/jev-latest'
+   */
+  decisionModel?: string;
+  /**
+   * Endpoint for decision models. Default: 'https://openrouter.ai/api/alpha/decisions'
+   */
+  decisionEndpoint?: string;
 }
 
 const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
+const DEFAULT_DECISION_ENDPOINT = 'https://openrouter.ai/api/alpha/decisions';
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 1000;
 
 /**
  * OpenRouter provider - access to 200+ models through one API.
+ * Supports embeddings, chat completions, and fast TypeSafe System One decision models.
  * Includes retry logic for transient 429/5xx errors.
  */
-export class OpenRouterProvider implements EmbeddingProvider, LLMProvider {
+export class OpenRouterProvider implements EmbeddingProvider, LLMProvider, DecisionProvider {
   private apiKey: string;
   private model: string;
   private embeddingModel: string;
   private reasoning: boolean;
+  private decisionModel: string;
+  private decisionEndpoint: string;
   readonly dimensions: number;
 
   constructor(config: OpenRouterProviderConfig) {
@@ -45,6 +55,8 @@ export class OpenRouterProvider implements EmbeddingProvider, LLMProvider {
     this.embeddingModel = config.embeddingModel ?? 'qwen/qwen3-embedding-8b';
     this.dimensions = config.embeddingDimensions ?? 1024;
     this.reasoning = config.reasoning ?? false;
+    this.decisionModel = config.decisionModel ?? '~typesafe/jev-latest';
+    this.decisionEndpoint = config.decisionEndpoint ?? DEFAULT_DECISION_ENDPOINT;
   }
 
   async generate(text: string): Promise<number[]> {
@@ -131,6 +143,49 @@ export class OpenRouterProvider implements EmbeddingProvider, LLMProvider {
         finishReason: choice?.finish_reason ?? choice?.native_finish_reason,
         maxTokens: options?.maxTokens,
       });
+    });
+  }
+
+  /**
+   * Fast System One decision call using TypeSafe models (e.g. ~typesafe/jev-latest).
+   * Evaluates structured noul, choice, and score questions in 70-500ms without text generation.
+   */
+  async decide(
+    request: DecisionRequest,
+    options?: { timeoutMs?: number },
+  ): Promise<DecisionResponse> {
+    return this.withRetry(async () => {
+      const controller = new AbortController();
+      const timeoutMs = options?.timeoutMs ?? 5000;
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const response = await fetch(this.decisionEndpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${this.apiKey}`,
+            'HTTP-Referer': 'https://bitwarelabs.com',
+            'X-OpenRouter-Title': 'bwmem',
+          },
+          body: JSON.stringify({
+            model: request.model ?? this.decisionModel,
+            state: request.state,
+            questions: request.questions,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok) {
+          const text = await response.text().catch(() => '');
+          throw new RetryableError(`OpenRouter decisions failed: ${response.status} ${text}`, response.status);
+        }
+
+        const data = (await response.json()) as DecisionResponse;
+        return data;
+      } finally {
+        clearTimeout(timer);
+      }
     });
   }
 
