@@ -70,8 +70,9 @@ describe('FactsService', () => {
 
   describe('storeFact', () => {
     it('inserts a new fact when none exists', async () => {
-      // Query order inside the transaction: advisory lock, SELECT existing, INSERT.
+      // Query order inside the transaction: advisory lock, tombstone check, SELECT existing, INSERT.
       pg.willReturn([]); // pg_advisory_xact_lock
+      pg.willReturn([]); // no tombstone
       pg.willReturn([]); // no existing fact
       pg.willReturn([{
         id: 'new-fact-1',
@@ -99,8 +100,26 @@ describe('FactsService', () => {
       expect(result.factValue).toBe('Alice');
     });
 
+    it('drops fact if tombstone exists', async () => {
+      pg.willReturn([]); // pg_advisory_xact_lock
+      pg.willReturn([{
+        fact_value: 'Alice',
+        value_hash: 'somehash',
+      }]); // tombstone exists
+
+      const result = await facts.storeFact({
+        userId: 'user-1',
+        category: 'personal',
+        key: 'name',
+        value: 'Alice',
+      });
+
+      expect(result).toBeNull();
+    });
+
     it('bumps mention_count when storing same value', async () => {
       pg.willReturn([]); // pg_advisory_xact_lock
+      pg.willReturn([]); // no tombstone
       pg.willReturn([{
         id: 'existing-1',
         fact_value: 'Alice',
@@ -230,6 +249,136 @@ describe('FactsService', () => {
       await facts.removeFact('fact-1');
       expect(pg.lastQuery).toContain("fact_status = 'expired'");
       expect(pg.lastParams?.[0]).toBe('fact-1');
+    });
+
+    it('records a tombstone when fact row is returned', async () => {
+      pg.willReturn([{
+        user_id: 'user-1',
+        fact_key: 'hobbies',
+        fact_value: 'skydiving',
+      }]); // UPDATE ... RETURNING row
+      pg.willReturn([{
+        id: 'tomb-1',
+        user_id: 'user-1',
+        fact_key: 'hobbies',
+        fact_value: 'skydiving',
+        value_hash: 'hash',
+        reason: 'User stopped',
+        source_fact_id: 'fact-1',
+        created_at: new Date().toISOString(),
+      }]); // INSERT INTO fact_tombstones
+
+      await facts.removeFact('fact-1', 'User stopped');
+      expect(pg.lastQuery).toContain('fact_tombstones');
+      expect(pg.lastParams?.[0]).toBe('user-1');
+      expect(pg.lastParams?.[1]).toBe('hobbies');
+      expect(pg.lastParams?.[2]).toBe('skydiving');
+      expect(pg.lastParams?.[4]).toBe('User stopped');
+    });
+
+    it('skips tombstone when tombstone: false', async () => {
+      pg.willReturn([{
+        user_id: 'user-1',
+        fact_key: 'hobbies',
+        fact_value: 'skydiving',
+      }]); // UPDATE ... RETURNING row
+
+      await facts.removeFact('fact-1', 'User stopped', { tombstone: false });
+      expect(pg.queries).toHaveLength(1);
+      expect(pg.lastQuery).not.toContain('fact_tombstones');
+    });
+  });
+
+  describe('tombstoneFact', () => {
+    it('records a tombstone and expires any active fact with that value', async () => {
+      pg.willReturn([{
+        id: 'tomb-1',
+        user_id: 'user-1',
+        fact_key: 'diet',
+        fact_value: 'vegan',
+        value_hash: 'hash',
+        reason: 'No longer vegan',
+        created_at: new Date().toISOString(),
+      }]); // INSERT INTO fact_tombstones
+      pg.willReturn([]); // UPDATE facts SET fact_status = 'expired'
+
+      const tomb = await facts.tombstoneFact('user-1', 'diet', 'vegan', 'No longer vegan');
+      expect(tomb.factKey).toBe('diet');
+      expect(tomb.factValue).toBe('vegan');
+      expect(pg.lastQuery).toContain("fact_status = 'expired'");
+      expect(pg.lastQuery).toContain("fact_status = 'active'");
+      expect(pg.lastParams?.[0]).toBe('user-1');
+      expect(pg.lastParams?.[1]).toBe('diet');
+      expect(pg.lastParams?.[2]).toBe('vegan');
+    });
+  });
+
+  describe('storeExtractedFacts with tombstones', () => {
+    it('skips tombstoned facts so extraction cannot silently re-assert them', async () => {
+      pg.willReturn([]); // loadDedupCandidates -> getUserFacts
+      pg.willReturn([]); // loadDedupCandidates -> exact matches
+      pg.willReturn([{
+        id: 'tomb-1',
+        user_id: 'user-1',
+        fact_key: 'city',
+        fact_value: 'Berlin',
+        value_hash: 'hash',
+        reason: 'User moved away',
+        created_at: new Date().toISOString(),
+      }]); // loadTombstonesForKeys -> 'city' has tombstone 'Berlin'
+
+      const extracted = [
+        {
+          category: 'personal' as const,
+          factKey: 'city',
+          factValue: 'Berlin',
+          confidence: 0.9,
+          factType: 'permanent' as const,
+          isCorrection: false,
+        },
+      ];
+
+      const stored = await facts.storeExtractedFacts('user-1', extracted);
+      expect(stored).toHaveLength(0);
+      expect(pg.queries.some(q => q.text.includes('INSERT INTO bwmem_facts'))).toBe(false);
+    });
+
+    it('stores non-tombstoned facts normally', async () => {
+      pg.willReturn([]); // loadDedupCandidates -> getUserFacts
+      pg.willReturn([]); // loadDedupCandidates -> exact matches
+      pg.willReturn([]); // loadTombstonesForKeys -> no tombstones
+      pg.willReturn([]); // pg_advisory_xact_lock
+      pg.willReturn([]); // no tombstone
+      pg.willReturn([]); // no existing fact
+      pg.willReturn([{
+        id: 'new-fact-1',
+        user_id: 'user-1',
+        category: 'personal',
+        fact_key: 'city',
+        fact_value: 'Hamburg',
+        confidence: 0.9,
+        fact_status: 'active',
+        fact_type: 'permanent',
+        override_priority: 0,
+        mention_count: 1,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      }]); // INSERT RETURNING
+
+      const extracted = [
+        {
+          category: 'personal' as const,
+          factKey: 'city',
+          factValue: 'Hamburg',
+          confidence: 0.9,
+          factType: 'permanent' as const,
+          isCorrection: false,
+        },
+      ];
+
+      const stored = await facts.storeExtractedFacts('user-1', extracted);
+      expect(stored).toHaveLength(1);
+      expect(stored[0].factValue).toBe('Hamburg');
     });
   });
 

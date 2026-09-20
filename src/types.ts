@@ -301,6 +301,17 @@ export interface ExtractedFact {
   isCorrection: boolean;
 }
 
+export interface FactTombstone {
+  id: string;
+  userId: string;
+  factKey: string;
+  factValue: string;
+  valueHash: string;
+  reason?: string;
+  sourceFactId?: string;
+  createdAt: Date;
+}
+
 // ---- Sessions ----
 
 export interface SessionConfig {

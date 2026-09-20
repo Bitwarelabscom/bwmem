@@ -112,7 +112,24 @@ export const deleteFactParamsSchema = z.object({
 
 export const deleteFactBodySchema = z.object({
   reason: z.string().optional(),
+  tombstone: z.boolean().optional(),
 }).optional();
+
+export const tombstoneFactBodySchema = z.object({
+  key: z.string().min(1).max(255),
+  value: z.string().min(1).max(10_000),
+  reason: z.string().max(1_000).optional(),
+});
+
+export const tombstonesQuerySchema = z.object({
+  key: z.string().max(255).optional(),
+  limit: z.coerce.number().int().positive().max(500).optional(),
+});
+
+export const deleteTombstoneParamsSchema = z.object({
+  userId: z.string().min(1).max(255),
+  tombstoneId: z.string().uuid(),
+});
 
 export const searchFactsQuerySchema = z.object({
   query: z.string().min(1).max(1_000),

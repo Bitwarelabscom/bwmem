@@ -2,13 +2,15 @@ import type { PgClient } from '../db/postgres.js';
 import type {
   LLMProvider, EmbeddingProvider, Logger,
   Fact, StoreFact, ExtractedFact, GraphPlugin, SimilarFactMatch,
+  FactTombstone,
 } from '../types.js';
 import { formatRelativeTime } from '../utils/time-utils.js';
 import { globalStats } from '../stats.js';
 import type { FactKeyMerge } from './fact-key-merge.service.js';
+import { TombstoneService, hashFactValue } from './tombstone.service.js';
 
 /** Normalize a fact key for dedup comparison: lowercase, strip underscores/hyphens, trim common prefixes. */
-function normalizeKey(key: string): string {
+export function normalizeKey(key: string): string {
   return key
     .toLowerCase()
     .replace(/[_\-\s]+/g, ' ')
@@ -17,7 +19,7 @@ function normalizeKey(key: string): string {
 }
 
 /** Check if two fact values are semantically similar (normalized string overlap). */
-function valuesAreSimilar(a: string, b: string): boolean {
+export function valuesAreSimilar(a: string, b: string): boolean {
   const na = a.toLowerCase().trim();
   const nb = b.toLowerCase().trim();
   if (na === nb) return true;
@@ -231,6 +233,7 @@ export class FactsService {
    * which is the behaviour before 0.5.0.
    */
   private keyMerge: FactKeyMerge | null;
+  private tombstones: TombstoneService;
 
   constructor(
     pg: PgClient,
@@ -240,6 +243,7 @@ export class FactsService {
     logger: Logger,
     embeddings: EmbeddingProvider | null = null,
     keyMerge: FactKeyMerge | null = null,
+    tombstones: TombstoneService | null = null,
   ) {
     this.pg = pg;
     this.llm = llm;
@@ -248,6 +252,11 @@ export class FactsService {
     this.prefix = prefix;
     this.logger = logger;
     this.keyMerge = keyMerge;
+    this.tombstones = tombstones ?? new TombstoneService(pg, prefix, logger);
+  }
+
+  get tombstoneService(): TombstoneService {
+    return this.tombstones;
   }
 
   /**
@@ -525,6 +534,15 @@ export class FactsService {
         userId, effectiveKey,
       ]);
 
+      // 0. Guard: check if value is tombstoned (rejected value on record).
+      const isTombstoned = await this.tombstones.isTombstoned(userId, effectiveKey, value, client);
+      if (isTombstoned) {
+        this.logger.debug('Dropped tombstoned fact (rejected value on record)', {
+          userId, key: effectiveKey, value,
+        });
+        return null;
+      }
+
       // 1. Find the existing active fact for this key.
       //
       // Scoped to (user_id, fact_key) ONLY — deliberately not category,
@@ -631,14 +649,73 @@ export class FactsService {
     });
   }
 
-  /** Remove (soft-delete) a fact by marking it as expired. */
-  async removeFact(factId: string, _reason?: string): Promise<void> {
+  /** Remove (soft-delete) a fact by marking it as expired and durable-tombstoning its value. */
+  async removeFact(factId: string, reason?: string, options?: { tombstone?: boolean }): Promise<void> {
+    const shouldTombstone = options?.tombstone ?? true;
+    const rows = await this.pg.query<{ user_id: string; fact_key: string; fact_value: string }>(
+      `UPDATE ${this.prefix}facts
+         SET fact_status = 'expired', superseded_at = NOW(), updated_at = NOW()
+       WHERE id = $1
+       RETURNING user_id, fact_key, fact_value`,
+      [factId]
+    );
+
+    const row = rows[0];
+    if (row && shouldTombstone) {
+      await this.tombstones.recordTombstone({
+        userId: row.user_id,
+        factKey: row.fact_key,
+        factValue: row.fact_value,
+        reason: reason ?? 'Fact removed',
+        sourceFactId: factId,
+      });
+    }
+  }
+
+  /**
+   * Explicitly record a rejected-value tombstone and expire any active fact
+   * currently asserting that value for the user and key.
+   */
+  async tombstoneFact(
+    userId: string,
+    key: string,
+    value: string,
+    reason?: string,
+  ): Promise<FactTombstone> {
+    const tombstone = await this.tombstones.recordTombstone({
+      userId,
+      factKey: key,
+      factValue: value,
+      reason: reason ?? 'Explicitly tombstoned',
+    });
+
     await this.pg.query(
       `UPDATE ${this.prefix}facts
          SET fact_status = 'expired', superseded_at = NOW(), updated_at = NOW()
-       WHERE id = $1`,
-      [factId]
+       WHERE user_id = $1 AND fact_key = $2 AND fact_status = 'active'
+         AND (fact_value = $3 OR LOWER(TRIM(fact_value)) = LOWER(TRIM($3)))`,
+      [userId, key, value]
     );
+
+    return tombstone;
+  }
+
+  /** Query tombstones for a user, optionally filtered by key. */
+  async getTombstones(
+    userId: string,
+    opts?: { factKey?: string; limit?: number },
+  ): Promise<FactTombstone[]> {
+    return this.tombstones.getTombstones(userId, opts);
+  }
+
+  /** Check whether a value is tombstoned for a user and key. */
+  async isTombstoned(userId: string, key: string, value: string): Promise<boolean> {
+    return this.tombstones.isTombstoned(userId, key, value);
+  }
+
+  /** Remove a tombstone for a user. */
+  async removeTombstone(userId: string, id: string): Promise<boolean> {
+    return this.tombstones.removeTombstone(userId, id);
   }
 
   /** Search facts by keyword match on fact_key or fact_value. */
@@ -922,6 +999,9 @@ Return [] if no facts found.`;
   async storeExtractedFacts(userId: string, facts: ExtractedFact[], sessionId?: string): Promise<Fact[]> {
     const existingFacts: Fact[] = await this.loadDedupCandidates(userId, facts);
 
+    const tombstoneKeys = Array.from(new Set(facts.map(f => f.factKey)));
+    const tombstonesByKey = await this.tombstones.loadTombstonesForKeys(userId, tombstoneKeys);
+
     const byNormKey = new Map<string, Fact[]>();
     for (const ef of existingFacts) {
       const k = normalizeKey(ef.factKey);
@@ -938,6 +1018,18 @@ Return [] if no facts found.`;
       if (FactsService.MULTI_VALUED_KEYS.has(keyNorm)) {
         const slug = f.factValue.toLowerCase().replace(/[^a-z0-9]+/g, '_').slice(0, 30);
         f.factKey = `${f.factKey}:${slug}`;
+      }
+
+      // Check if this fact value has been tombstoned for this key
+      const keyTombstones = tombstonesByKey.get(f.factKey);
+      const isTombstoned = keyTombstones?.some(t =>
+        t.valueHash === hashFactValue(f.factValue) || valuesAreSimilar(t.factValue, f.factValue)
+      );
+      if (isTombstoned) {
+        this.logger.debug('Dedup: skipping tombstoned fact', {
+          key: f.factKey, value: f.factValue,
+        });
+        continue;
       }
 
       const normKey = normalizeKey(f.factKey);

@@ -7,6 +7,7 @@ import type { PgClient } from '../../db/postgres.js';
 import {
   factsParamsSchema, factsQuerySchema, storeFactSchema,
   deleteFactParamsSchema, deleteFactBodySchema, searchFactsQuerySchema,
+  tombstoneFactBodySchema, tombstonesQuerySchema, deleteTombstoneParamsSchema,
 } from '../utils/schemas.js';
 import { scopeUserId, isScopedToTenant, stripTenantFromResponse } from '../utils/tenant-scope.js';
 import { NotFoundError, ForbiddenError } from '../utils/errors.js';
@@ -83,7 +84,45 @@ export async function factRoutes(
     if (!row) throw new NotFoundError('Fact not found');
     if (!isScopedToTenant(row.user_id, tenant.id)) throw new ForbiddenError();
 
-    await bwmem.facts.remove(factId, body?.reason);
+    await bwmem.facts.remove(factId, body?.reason, { tombstone: body?.tombstone ?? true });
+    return { success: true, data: { deleted: true } };
+  });
+
+  // POST /facts/:userId/tombstones
+  app.post('/facts/:userId/tombstones', async (request: FastifyRequest, _reply) => {
+    const tenant = request.tenant!;
+    const { userId } = factsParamsSchema.parse(request.params);
+    const body = tombstoneFactBodySchema.parse(request.body);
+    const scopedUserId = scopeUserId(tenant.id, userId);
+
+    const tombstone = await bwmem.facts.tombstone(
+      scopedUserId, body.key, body.value, body.reason,
+    );
+    return { success: true, data: { tombstone: stripTenantFromResponse(tombstone) } };
+  });
+
+  // GET /facts/:userId/tombstones
+  app.get('/facts/:userId/tombstones', async (request: FastifyRequest, _reply) => {
+    const tenant = request.tenant!;
+    const { userId } = factsParamsSchema.parse(request.params);
+    const q = tombstonesQuerySchema.parse(request.query ?? {});
+    const scopedUserId = scopeUserId(tenant.id, userId);
+
+    const tombstones = await bwmem.facts.getTombstones(scopedUserId, {
+      factKey: q.key,
+      limit: q.limit,
+    });
+    return { success: true, data: { tombstones: stripTenantFromResponse(tombstones) } };
+  });
+
+  // DELETE /facts/:userId/tombstones/:tombstoneId
+  app.delete('/facts/:userId/tombstones/:tombstoneId', async (request: FastifyRequest, _reply) => {
+    const tenant = request.tenant!;
+    const { userId, tombstoneId } = deleteTombstoneParamsSchema.parse(request.params);
+    const scopedUserId = scopeUserId(tenant.id, userId);
+
+    const deleted = await bwmem.facts.removeTombstone(scopedUserId, tombstoneId);
+    if (!deleted) throw new NotFoundError('Tombstone not found');
     return { success: true, data: { deleted: true } };
   });
 

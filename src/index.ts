@@ -39,6 +39,7 @@ export type {
   Fact,
   StoreFact,
   ExtractedFact,
+  FactTombstone,
   FactCategory,
   FactStatus,
   FactType,
@@ -164,3 +165,9 @@ export type { TypeSafeProviderConfig } from './providers/typesafe.js';
 export { OpenRouterProvider } from './providers/openrouter.js';
 export { OpenAIProvider } from './providers/openai.js';
 export { OllamaProvider } from './providers/ollama.js';
+
+// Rejected-value tombstones
+export {
+  TombstoneService, hashFactValue, formatTombstoneForPrompt,
+} from './memory/tombstone.service.js';
+export type { RecordTombstoneInput } from './memory/tombstone.service.js';

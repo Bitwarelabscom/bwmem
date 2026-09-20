@@ -6,6 +6,7 @@ import type {
   EmotionalMoment,
   BehavioralObservation,
   Fact,
+  FactTombstone,
   MemoryContext,
   QualityStats,
   SelfIntention,
@@ -41,6 +42,7 @@ import { SessionTextureService } from './memory/session-texture.service.js';
 import { SelfIntentionService, type IntentionPromptOptions } from './memory/self-intention.service.js';
 import { CuratorRejectionService, type DroppedMemoryItem } from './memory/curator-rejection.service.js';
 import { MemoryCurationService } from './memory/memory-curation.service.js';
+import { TombstoneService } from './memory/tombstone.service.js';
 import { SessionManager } from './session/session-manager.js';
 import { ConsolidationScheduler } from './consolidation/scheduler.js';
 import type { Session } from './session/session.js';
@@ -64,6 +66,7 @@ interface Services {
   selfIntention: SelfIntentionService;
   curatorRejection: CuratorRejectionService;
   curator: MemoryCurationService;
+  tombstones: TombstoneService;
   contextBuilder: ContextBuilder;
   sessionManager: SessionManager;
   scheduler: ConsolidationScheduler | null;
@@ -112,9 +115,10 @@ export class BwMem {
       this.config.factKeyMerge,
     );
 
+    const tombstones = new TombstoneService(pg, prefix, logger);
     const facts = new FactsService(
       pg, this.config.llm, this.config.graph ?? null,
-      prefix, logger, this.config.embeddings, keyMerge,
+      prefix, logger, this.config.embeddings, keyMerge, tombstones,
     );
     const temporalEvents = new TemporalEventsService(
       pg, prefix, this.config.llm, this.config.embeddings, logger,
@@ -166,7 +170,7 @@ export class BwMem {
       emotionalMoments, contradictions, behavioral, summaries, temporalEvents,
       factCollisions,
       qualityScorer, sessionTexture, selfIntention,
-      curatorRejection, curator,
+      curatorRejection, curator, tombstones,
       contextBuilder, sessionManager, scheduler,
     };
 
@@ -207,7 +211,15 @@ export class BwMem {
       getAsOf: (userId, asOfValidTime, asOfTxnTime, opts) =>
         s.facts.getFactsAsOf(userId, asOfValidTime, asOfTxnTime, opts),
       store: (input) => s.facts.storeFact(input),
-      remove: (factId, reason) => s.facts.removeFact(factId, reason),
+      remove: (factId, reason, opts) => s.facts.removeFact(factId, reason, opts),
+      tombstone: (userId, key, value, reason) =>
+        s.facts.tombstoneFact(userId, key, value, reason),
+      getTombstones: (userId, opts) =>
+        s.facts.getTombstones(userId, opts),
+      isTombstoned: (userId, key, value) =>
+        s.facts.isTombstoned(userId, key, value),
+      removeTombstone: (userId, id) =>
+        s.facts.removeTombstone(userId, id),
       search: (userId, query) => s.facts.searchFacts(userId, query),
       findSimilar: (userId, value, opts) => s.facts.findSimilarActiveFact(userId, value, opts),
       touchMention: (factId) => s.facts.touchFactMention(factId),
@@ -422,7 +434,11 @@ interface FactsAPI {
     opts?: { category?: string; limit?: number },
   ): Promise<Fact[]>;
   store(input: StoreFact): Promise<Fact | null>;
-  remove(factId: string, reason?: string): Promise<void>;
+  remove(factId: string, reason?: string, options?: { tombstone?: boolean }): Promise<void>;
+  tombstone(userId: string, key: string, value: string, reason?: string): Promise<FactTombstone>;
+  getTombstones(userId: string, opts?: { factKey?: string; limit?: number }): Promise<FactTombstone[]>;
+  isTombstoned(userId: string, key: string, value: string): Promise<boolean>;
+  removeTombstone(userId: string, id: string): Promise<boolean>;
   search(userId: string, query: string): Promise<Fact[]>;
   findSimilar(userId: string, value: string, opts?: { threshold?: number; limit?: number }): Promise<SimilarFactMatch | null>;
   touchMention(factId: string): Promise<void>;

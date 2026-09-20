@@ -69,17 +69,19 @@ await mem.shutdown();
 
 PRs welcome. Maintainer is async and low-bandwidth — expect slow replies, not silence forever.
 
-**v0.12.0 — TypeSafe AI (Jev) System One decision models, ~250ms merge gating, curator rejection ledger & in-band count ring, and standing holds displacement age.**
-TypeSafe AI decision models are now integrated directly into `bwmem`, available both natively and via OpenRouter (`~typesafe/jev-latest` at `https://openrouter.ai/api/alpha/decisions`). System One decision models evaluate structured primitives (`noul`, `choice`, `score`) with calibrated probabilities in 70–500ms without autoregressive text generation:
-1. **Autonomous Fact Merge Gate Fast Path**: DeMem Theorem 1 decision compatibility evaluated in ~250ms flat (replacing multi-second generative LLM calls).
-2. **Pre-Reply Memory Curation**: Parallel candidate evaluation via calibrated `noul` decisions with capacity bounds and an honest in-band token-0 count ring (`[Curator: N evaluated, K kept, D dropped]`).
-3. **Curator Rejection Ledger**: Session-persistent buffer (TTL 7d) capturing pruned candidates with probability metadata (`[p=0.12]`), queryable by topic/keyword regardless of score via `review_dropped_memories`.
-4. **Standing Holds Passive Displacement Ring**: Tracks `oldestHeldDays` computed from `min(held_at)` in contradiction signal counts.
+**v0.13.0 — Rejected-Value Tombstones, Durable Excision Audit, and Re-Assertion Prevention.**
+Addresses the core epistemic retention gap identified in the [Agent Memory Atlas](https://neoneye.github.io/agent-memory-atlas/systems/bwmem/):
+1. **Rejected-Value Tombstones (Migration 019)**: Durable, value-keyed records in `fact_tombstones` (`user_id`, `fact_key`, `fact_value`, `value_hash`, `reason`, `source_fact_id`). Keyed on the rejected value so background extraction passes cannot silently re-assert deleted or rejected facts from raw conversation logs.
+2. **Extraction & Write Path Gating**: `storeFact` and `storeExtractedFacts` consult the tombstone store via exact value hashing ($O(1)$) and normalized token overlap (`valuesAreSimilar`), withholding tombstoned values before storage.
+3. **Automatic Excision Tombstoning**: Deleting a fact via `removeFact(factId, reason)` automatically writes a tombstone by default, ensuring deletions persist across extraction sweeps.
+4. **Direct Tombstone APIs & REST Endpoints**: `bwmem.facts.tombstone()`, `bwmem.facts.getTombstones()`, `bwmem.facts.isTombstoned()`, `bwmem.facts.removeTombstone()`, and HTTP routes `POST /facts/:userId/tombstones`, `GET /facts/:userId/tombstones`, `DELETE /facts/:userId/tombstones/:tombstoneId`.
 
-See [What's new in 0.12.0](#whats-new-in-0120), [0.11.1](#whats-new-in-0111), [0.11.0](#whats-new-in-0110), and [0.10.0](#whats-new-in-0100).
+See [What's new in 0.13.0](#whats-new-in-0130), [0.12.0](#whats-new-in-0120), [0.11.1](#whats-new-in-0111), and [0.11.0](#whats-new-in-0110).
 
 ## Features
 
+- **Rejected-value tombstones** — durable value-keyed records (`fact_tombstones`) preventing subsequent extraction passes from silently re-asserting excised or user-rejected facts (0.13.0)
+- **Automatic excision tombstoning** — `removeFact` and direct tombstone APIs record reasons and guarantee deletions survive background re-extraction passes (0.13.0)
 - **TypeSafe AI (Jev) decision models** — System One structured decisions (`noul`, `choice`, `score`) in 70–500ms via OpenRouter (`~typesafe/jev-latest`) or native TypeSafe API (0.12.0)
 - **Fast fact merge gating** — ~250ms decision compatibility check via choice questions, preventing 7% timeout hangs on generative LLM merge checks (0.12.0)
 - **Pre-reply memory curation** — parallel relevance evaluation with honest in-band token-0 count ring (`[Curator: N evaluated, K kept, D dropped]`) and no synthetic hero-fact disguises (0.12.0)
@@ -235,6 +237,55 @@ consolidation staging. bwmem should land in the same range for that reason.
 its footnote. The adapter that does it drives only the public API, so what it
 measures is what `npm install @bitwarelabs/bwmem` gives you, defaults included.
 The remaining rows are still the parent stack's.
+
+## What's new in 0.13.0
+
+### Rejected-Value Tombstones, Durable Excision Audit, and Re-Assertion Prevention
+
+v0.13.0 implements the **Rejected-Value Tombstone** mechanism, addressing the key rubric gap identified in the [Agent Memory Atlas](https://neoneye.github.io/agent-memory-atlas/systems/bwmem/) analysis of bwmem.
+
+#### The Problem: Silent Re-Assertion on Background Passes
+Previously in bwmem (and in most agent memory systems), calling `removeFact` or correcting a fact marked that specific row `expired` or `superseded`.
+However, background extractors re-reading raw conversation logs or session transcripts would re-extract the exact same claim from historical messages. Seeing no `active` fact for `(user_id, fact_key)`, the pipeline would re-insert the rejected claim as active. As the Agent Memory Atlas notes:
+> *"A missing tombstone produces a confident answer built on a value the user already rejected, and nothing in the system knows... it is the mechanism that decides whether 'forget that' survives the next background pass."*
+
+#### 1. Schema Migration (`019_fact_tombstones.sql`)
+Creates `${prefix}fact_tombstones`:
+- `user_id`: Tenant/user scope.
+- `fact_key`: The fact key being guarded.
+- `fact_value`: The plaintext rejected value.
+- `value_hash`: Deterministic SHA-256 hash of normalized lowercase trimmed text.
+- `reason`: Explanation or justification for the excision.
+- `source_fact_id`: Lineage link to the original fact row (if removed from an existing record).
+- `created_at`: Excision timestamp.
+- Unique index on `(user_id, fact_key, value_hash)` for idempotent inserts, plus lookup indexes on `(user_id, fact_key)` and `(user_id, created_at DESC)`.
+
+#### 2. Write & Extraction Pipeline Gating
+- **Background Extraction (`storeExtractedFacts`)**: Batch-loads tombstones for all extracted fact keys up front in a single query (`loadTombstonesForKeys`) and filters out any candidate fact whose value matches a tombstone (by exact hash or normalized similarity overlap `valuesAreSimilar`).
+- **Transactional Write Path (`storeFact`)**: Inside the advisory lock transaction, checks `isTombstoned` before creating an active row. Tombstoned claims are cleanly dropped (`null` return, logged at debug level).
+- **Deletion Path (`removeFact`)**: Soft-deleting an active fact now automatically records a tombstone row carrying `reason` and `source_fact_id` by default (`{ tombstone: true }`).
+- **Direct Excision (`tombstoneFact`)**: Immediately records a tombstone and expires any active facts currently asserting that value.
+
+#### 3. SDK & REST API
+```typescript
+// Explicitly tombstone a rejected value
+await mem.facts.tombstone('user-123', 'diet', 'vegan', 'User clarified they eat fish and dairy');
+
+// Check if a value is tombstoned
+const blocked = await mem.facts.isTombstoned('user-123', 'diet', 'vegan');
+
+// List tombstones for a user
+const tombstones = await mem.facts.getTombstones('user-123', { factKey: 'diet' });
+
+// Remove a tombstone if a preference is later re-adopted
+await mem.facts.removeTombstone('user-123', tombstoneId);
+```
+
+REST API routes:
+- `POST /facts/:userId/tombstones` — body: `{ key, value, reason }`
+- `GET /facts/:userId/tombstones?key=diet&limit=50`
+- `DELETE /facts/:userId/tombstones/:tombstoneId`
+- `DELETE /facts/:factId` — accepts optional `{ reason, tombstone: true|false }`
 
 ## What's new in 0.12.0
 
