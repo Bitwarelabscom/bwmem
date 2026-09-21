@@ -87,7 +87,7 @@ const GATHER_PATTERNS: Array<[RegExp, string]> = [
  * `gather` uses 0.35 floor, depth 200, session diversification and ±1 turn dialogue windowing.
  */
 const PROFILES: Record<RetrievalIntent, { limit: number; threshold: number; sessionDiversify: boolean; windowTurns: number }> = {
-  pinpoint: { limit: 25, threshold: 0.5, sessionDiversify: false, windowTurns: 0 },
+  pinpoint: { limit: 25, threshold: 0.4, sessionDiversify: false, windowTurns: 0 },
   gather: { limit: 200, threshold: 0.35, sessionDiversify: true, windowTurns: 1 },
 };
 

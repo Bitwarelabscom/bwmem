@@ -127,14 +127,15 @@ All models below were evaluated against **byte-identical retrieved context** acr
 
 | System | Reader Model | Retrieval | Overall Score |
 |---|---|---|---|
-| **bwmem (v0.11 engine)** | `qwen/qwen3.8-max` | adaptive | **85.0% (51/60)** \* |
-| **bwmem (v0.11 engine)** | `z-ai/glm-5.3` | adaptive | **81.7% (49/60)** \* |
-| **bwmem (v0.11 engine)** | `google/gemini-3.7-flash` | adaptive | **81.7% (49/60)** |
-| **bwmem (v0.11 engine)** | `meta/muse-spark-1.2-contributor` | adaptive | **80.0% (48/60)** |
-| **bwmem (v0.11 engine)** | `upstage/solar-pro4` | adaptive | **80.0% (48/60)** |
-| **bwmem (v0.11 engine)** | `qwen/qwen3.7-flash` | adaptive | **78.3% (47/60)** |
-| **bwmem (v0.11 engine)** | `z-ai/glm-5.3-flash` | adaptive | **78.3% (47/60)** † |
-| **bwmem (v0.11 engine)** | `openai/gpt-5.6-sol-pro` | adaptive | **75.0% (45/60)** ‡ |
+| **bwmem (v0.13.0 + Jev)** | `deepseek/deepseek-v4.1-flash` | adaptive + Jev (250q) | **93.2% (233/250)** |
+| **bwmem (v0.11 engine)** | `qwen/qwen3.8-max` | adaptive (60q) | **85.0% (51/60)** \* |
+| **bwmem (v0.11 engine)** | `z-ai/glm-5.3` | adaptive (60q) | **81.7% (49/60)** \* |
+| **bwmem (v0.11 engine)** | `google/gemini-3.7-flash` | adaptive (60q) | **81.7% (49/60)** |
+| **bwmem (v0.11 engine)** | `meta/muse-spark-1.2-contributor` | adaptive (60q) | **80.0% (48/60)** |
+| **bwmem (v0.11 engine)** | `upstage/solar-pro4` | adaptive (60q) | **80.0% (48/60)** |
+| **bwmem (v0.11 engine)** | `qwen/qwen3.7-flash` | adaptive (60q) | **78.3% (47/60)** |
+| **bwmem (v0.11 engine)** | `z-ai/glm-5.3-flash` | adaptive (60q) | **78.3% (47/60)** † |
+| **bwmem (v0.11 engine)** | `openai/gpt-5.6-sol-pro` | adaptive (60q) | **75.0% (45/60)** ‡ |
 | **bwmem (v0.11 engine)** | `qwen/qwen3.8-flash` | adaptive | **75.0% (45/60)** |
 | **bwmem (v0.11 engine)** | `inclusionai/ling-3.0-flash` | adaptive | **71.7% (43/60)** |
 | **bwmem (v0.11 engine)** | `deepseek/deepseek-v4-pro` | adaptive | **70.0% (42/60)** |
@@ -150,6 +151,22 @@ All models below were evaluated against **byte-identical retrieved context** acr
 *\* `qwen3.8-max` scored **86.4% (51/59)** and `glm-5.3` scored **83.1% (49/59)** over completed non-truncated answers (1 answer reached token ceiling on deep reasoning).  
 † `glm-5.3-flash` scored **81.0% (47/58)** over completed non-truncated answers.  
 ‡ `gpt-5.6-sol-pro` achieved a **0% abstention rate** across all 60 queries.*
+
+### 250-Question Stratified Benchmark (v0.13.0 + TypeSafe Jev Routing)
+
+Evaluated on the expanded **250-question stratified LongMemEval benchmark** across 123,575 ingested turns, 131,422 facts, and 25,094 temporal events. Query intent was dynamically routed via native TypeSafe Jev decision models, and answered by `deepseek/deepseek-v4.1-flash`:
+
+| Category | Questions | Correct | Accuracy |
+|---|:---:|:---:|:---:|
+| **Single-Session (Assistant)** | 28 | 28 | **100.0%** |
+| **Single-Session (User)** | 35 | 34 | **97.1%** |
+| **Single-Session (Preference)** | 16 | 15 | **93.8%** |
+| **Multi-Session Synthesis** | 66 | 61 | **92.4%** |
+| **Temporal Reasoning** | 66 | 61 | **92.4%** |
+| **Knowledge-Update** | 39 | 34 | **87.2%** |
+| **TOTAL BENCHMARK** | **250** | **233** | **93.20%** |
+
+*All 250 responses were manually inspected and evaluated against ground-truth references with mathematical and supersession equivalence verified.*
 
 ### Detailed Category Breakdown (60 Questions)
 

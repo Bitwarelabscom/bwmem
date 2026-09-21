@@ -78,6 +78,9 @@ const MAIL_SMTP_PORT = parseInt(process.env.MAIL_SMTP_PORT ?? '587', 10);
 const MAIL_SMTP_SECURE = process.env.MAIL_SMTP_SECURE === 'true';
 const MAIL_SMTP_TLS_REJECT = process.env.MAIL_SMTP_TLS_REJECT_UNAUTHORIZED !== 'false';
 const KEY_ROTATION_GRACE_HOURS = parseInt(process.env.KEY_ROTATION_GRACE_HOURS ?? '24', 10);
+const TYPESAFE_API_KEY = process.env.TYPESAFE_API_KEY ?? '';
+const TYPESAFE_URL = process.env.TYPESAFE_URL ?? 'https://api.typesafe.ai/v1';
+const TYPESAFE_MODEL = process.env.TYPESAFE_MODEL ?? 'jev-latest';
 
 const VERSION = '0.3.0';
 
@@ -206,12 +209,25 @@ export async function buildApp(): Promise<{
     });
   }
 
+  // System One Decision Provider (TypeSafe AI / Jev)
+  let decisionProvider: import('../types.js').DecisionProvider | undefined;
+  if (TYPESAFE_API_KEY) {
+    const { TypeSafeProvider } = await import('../providers/typesafe.js');
+    decisionProvider = new TypeSafeProvider({
+      apiKey: TYPESAFE_API_KEY,
+      url: TYPESAFE_URL,
+      model: TYPESAFE_MODEL,
+    });
+    app.log.info(`TypeSafe decision provider enabled (${TYPESAFE_MODEL} via ${TYPESAFE_URL})`);
+  }
+
   // Initialize BwMem SDK
   const bwmem = new BwMem({
     postgres: DATABASE_URL,
     redis: REDIS_URL,
     embeddings: trackedEmbed,
     llm: trackedLLM,
+    decision: decisionProvider,
     graph: graphPlugin,
     tablePrefix: TABLE_PREFIX,
     logger: sdkLogger,

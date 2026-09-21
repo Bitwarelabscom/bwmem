@@ -30,7 +30,7 @@ const DEFAULT_TIMEOUT_MS = 5000;
  * wrong thing; every one of these is overridable per call.
  */
 const DEFAULT_RECALL_K = 25;
-const DEFAULT_SIMILARITY_THRESHOLD = 0.5;
+const DEFAULT_SIMILARITY_THRESHOLD = 0.4;
 /** 0 = do not truncate. */
 const DEFAULT_CLIP_CHARS = 0;
 /** Fusion weight for the keyword arm. Below 1 on purpose — see recallMessages. */
@@ -203,6 +203,10 @@ export class ContextBuilder {
         finalConvs = curated.similarConversations;
         curatorRing = curated.curatorRing;
       }
+    }
+
+    if (profile?.reason === 'temporal-duration') {
+      finalFacts = finalFacts.filter(f => !f.factKey.includes('duration'));
     }
 
     const formatted = this.format(

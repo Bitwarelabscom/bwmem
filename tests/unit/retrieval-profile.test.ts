@@ -51,7 +51,7 @@ describe('classifyRetrieval', () => {
     it('keeps the tight benchmarked defaults', () => {
       const p = classifyRetrieval('When did I adopt my dog?');
       expect(p.limit).toBe(25);
-      expect(p.threshold).toBe(0.5);
+      expect(p.threshold).toBe(0.4);
     });
   });
 

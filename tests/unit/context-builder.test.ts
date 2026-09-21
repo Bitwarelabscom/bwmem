@@ -118,10 +118,10 @@ describe('ContextBuilder', () => {
       expect(recallQuery(pg)?.params).toContain(25);
     });
 
-    it('uses a 0.5 cosine floor, not 0.25', async () => {
+    it('uses a 0.4 cosine floor, not 0.25', async () => {
       for (let i = 0; i < 15; i++) pg.willReturn([]);
       await builder.build('user-1', { query: 'hiking' });
-      expect(recallQuery(pg)?.params).toContain(0.5);
+      expect(recallQuery(pg)?.params).toContain(0.4);
     });
 
     it('honours explicit overrides', async () => {
